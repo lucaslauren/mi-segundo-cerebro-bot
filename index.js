@@ -14,7 +14,6 @@ const anthropic = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
 
 // Variables de configuración
 const NOTION_DATABASE_ID = '2fe6046f0fee81719744f6bd897e0dc3';
-const GOOGLE_CHAT_SPACE = process.env.GOOGLE_CHAT_SPACE; // Ej: "spaces/XXXXXX"
 
 // Proyectos/Empresas que maneja Lucas
 const PROJECTS = {
@@ -38,19 +37,25 @@ app.post('/webhook/google-chat', async (req, res) => {
 
     const userText = message.text.trim();
     const spaceId = message.space.name;
-    const userId = message.sender.name;
 
-    // 1. Procesar el texto/audio con Claude para clasificación
+    // 1. Procesar el texto con Claude para clasificación
     const classification = await classifyTask(userText);
 
     // 2. Guardar en Notion
     const notionResponse = await saveToNotion(classification);
 
     // 3. Responder en Google Chat
-    const responseMessage = buildChatResponse(classification, notionResponse);
-    await sendGoogleChatMessage(spaceId, responseMessage);
+    const responseMessage = buildChatResponse(classification);
+    
+    console.log('✅ Tarea guardada correctamente en Notion');
+    console.log('📌 Clasificación:', classification);
 
-    res.status(200).send({ actionResponse: { type: 'UPDATE_MESSAGE', text: 'Tarea guardada' } });
+    res.status(200).send({ 
+      actionResponse: { 
+        type: 'UPDATE_MESSAGE', 
+        text: responseMessage 
+      } 
+    });
   } catch (error) {
     console.error('Error en webhook:', error);
     res.status(500).send('Error processing message');
@@ -184,7 +189,7 @@ async function saveToNotion(classification) {
 /**
  * Construir respuesta para Google Chat
  */
-function buildChatResponse(classification, notionResponse) {
+function buildChatResponse(classification) {
   return `✅ *Tarea guardada en Notion*
 
 📝 *${classification.taskTitle}*
@@ -195,23 +200,6 @@ function buildChatResponse(classification, notionResponse) {
 
 ${classification.suggestedDate ? `📅 Fecha sugerida: ${classification.suggestedDate}` : ''}
 ${classification.relatedTo ? `🔗 Relacionado con: ${classification.relatedTo}` : ''}`;
-}
-
-/**
- * Enviar mensaje a Google Chat
- */
-async function sendGoogleChatMessage(spaceId, messageText) {
-  try {
-    await axios.post(`https://chat.googleapis.com/v1/${spaceId}/messages`, {
-      text: messageText
-    }, {
-      headers: {
-        'Authorization': `Bearer ${process.env.GOOGLE_CHAT_TOKEN}`
-      }
-    });
-  } catch (error) {
-    console.error('Error sending Google Chat message:', error);
-  }
 }
 
 // Health check
