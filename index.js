@@ -34,6 +34,10 @@ function getCalendarClient() {
     const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}';
     const credentials = JSON.parse(raw);
     if (!credentials.client_email) return null;
+    // Sanitizar private_key — las variables de entorno convierten \n en \\n
+    if (credentials.private_key) {
+      credentials.private_key = credentials.private_key.replace(/\\n/g, '\n');
+    }
     const auth = new google.auth.JWT(
       credentials.client_email,
       null,
@@ -182,8 +186,11 @@ async function procesarIntencion(texto) {
 
   const raw = response.content[0].text.trim();
   console.log('🤖 Claude:', raw);
-  const clean = raw.replace(/```json|```/g, '').trim();
-  return JSON.parse(clean);
+
+  // Extraer solo el bloque JSON aunque venga con texto alrededor
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error('Claude no devolvió JSON válido');
+  return JSON.parse(jsonMatch[0]);
 }
 
 // ─── Ejecutar intención ───────────────────────────────────────────────────────
@@ -481,15 +488,30 @@ async function guardarEnNotion(tarea) {
 
 // ─── BUSCAR TAREAS POR TEXTO ──────────────────────────────────────────────────
 async function buscarTareasPorTexto(busqueda) {
+  // Intentar búsqueda con cada palabra significativa hasta encontrar resultados
   const palabras = busqueda.split(' ').filter(p => p.length > 3);
-  const keyword = palabras[0] || busqueda;
+  
+  for (const palabra of palabras) {
+    const response = await notion.databases.query({
+      database_id: NOTION_DB_ID,
+      filter: {
+        and: [
+          { property: 'Hecho', checkbox: { equals: false } },
+          { property: 'Siguiente acción', title: { contains: palabra } }
+        ]
+      },
+      page_size: 10
+    });
+    if (response.results.length > 0) return response.results.map(mapTarea);
+  }
 
+  // Fallback: búsqueda con la frase completa
   const response = await notion.databases.query({
     database_id: NOTION_DB_ID,
     filter: {
       and: [
         { property: 'Hecho', checkbox: { equals: false } },
-        { property: 'Siguiente acción', title: { contains: keyword } }
+        { property: 'Siguiente acción', title: { contains: busqueda } }
       ]
     },
     page_size: 10
