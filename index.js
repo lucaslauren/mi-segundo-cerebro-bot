@@ -90,7 +90,7 @@ FORMATO DE RESPUESTA (JSON estricto):
 
 // ─── Health check ────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'running', version: '2.0.1' });
+  res.status(200).json({ status: 'running', version: '2.0.0' });
 });
 
 // ─── Webhook principal de Google Chat ────────────────────────────────────────
@@ -101,14 +101,23 @@ app.post('/webhook/google-chat', async (req, res) => {
   res.status(200).json({ ok: true });
 
   try {
-    const { message } = req.body;
-    if (!message) return;
+    const body = req.body;
+
+    // Google Chat puede mandar dos estructuras distintas según el tipo de evento
+    // Estructura 1 (legacy): body.message
+    // Estructura 2 (nueva API): body.chat.messagePayload.message
+    let message = body.message || body.chat?.messagePayload?.message;
+    let spaceId = message?.space?.name || body.chat?.messagePayload?.space?.name;
+
+    if (!message) {
+      console.log('⚠️ No se encontró message en el body:', JSON.stringify(body));
+      return;
+    }
 
     // Ignorar mensajes del propio bot
     if (message.sender?.type === 'BOT') return;
 
-    const spaceId = message.space?.name;
-    const userText = message.text?.trim();
+    const userText = message.text?.trim() || message.argumentText?.trim();
     const attachments = message.attachment || [];
 
     // ── Comandos especiales ──────────────────────────────────────────────────
