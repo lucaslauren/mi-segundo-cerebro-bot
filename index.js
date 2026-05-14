@@ -97,69 +97,63 @@ app.get('/health', (req, res) => {
 app.post('/webhook/google-chat', async (req, res) => {
   console.log('📨 Mensaje recibido:', JSON.stringify(req.body, null, 2));
 
-  // Google Chat requiere respuesta inmediata
-  res.status(200).json({ ok: true });
-
   try {
     const body = req.body;
 
-    // Google Chat puede mandar dos estructuras distintas según el tipo de evento
-    // Estructura 1 (legacy): body.message
-    // Estructura 2 (nueva API): body.chat.messagePayload.message
+    // Google Chat nueva API: body.chat.messagePayload.message
+    // Google Chat legacy: body.message
     let message = body.message || body.chat?.messagePayload?.message;
-    let spaceId = message?.space?.name || body.chat?.messagePayload?.space?.name;
 
     if (!message) {
-      console.log('⚠️ No se encontró message en el body:', JSON.stringify(body));
-      return;
+      console.log('⚠️ No se encontró message en el body');
+      return res.status(200).json({ text: '⚠️ Mensaje no reconocido.' });
     }
 
     // Ignorar mensajes del propio bot
-    if (message.sender?.type === 'BOT') return;
+    if (message.sender?.type === 'BOT') {
+      return res.status(200).json({ ok: true });
+    }
 
     const userText = message.text?.trim() || message.argumentText?.trim();
     const attachments = message.attachment || [];
 
     // ── Comandos especiales ──────────────────────────────────────────────────
     if (userText?.toLowerCase() === '/semana') {
-      await procesarPlanSemanal(spaceId);
-      return;
+      const resp = await procesarPlanSemanal();
+      return res.status(200).json({ text: resp });
     }
 
     if (userText?.toLowerCase() === '/inbox') {
-      await procesarResumenInbox(spaceId);
-      return;
+      const resp = await procesarResumenInbox();
+      return res.status(200).json({ text: resp });
     }
 
     if (userText?.toLowerCase() === '/hoy') {
-      await procesarPlanHoy(spaceId);
-      return;
+      const resp = await procesarPlanHoy();
+      return res.status(200).json({ text: resp });
     }
 
     if (userText?.toLowerCase() === '/ayuda') {
-      await enviarMensajeChat(spaceId, getMensajeAyuda());
-      return;
+      return res.status(200).json({ text: getMensajeAyuda() });
     }
 
     // ── Procesar audio (adjunto) ─────────────────────────────────────────────
     if (attachments.length > 0) {
-      await enviarMensajeChat(spaceId, '🎙️ _Audio recibido. La transcripción de voz está en desarrollo — por ahora mandá el texto directamente._');
-      return;
+      return res.status(200).json({ text: '🎙️ Audio recibido. La transcripción de voz está en desarrollo — por ahora mandá el texto directamente.' });
     }
 
     // ── Procesar mensaje de texto ────────────────────────────────────────────
-    if (!userText) return;
+    if (!userText) {
+      return res.status(200).json({ ok: true });
+    }
 
-    await enviarMensajeChat(spaceId, '⏳ _Procesando..._');
-
+    // Clasificar con Claude y guardar en Notion
     const clasificacion = await clasificarConClaude(userText);
 
     if (!clasificacion || !clasificacion.tareas?.length) {
-      await enviarMensajeChat(spaceId, '❌ No pude clasificar eso. Probá con una tarea más específica.');
-      return;
+      return res.status(200).json({ text: '❌ No pude clasificar eso. Probá con una tarea más específica.' });
     }
 
-    // Guardar cada tarea en Notion
     const resultados = [];
     for (const tarea of clasificacion.tareas) {
       const notionPage = await guardarEnNotion(tarea);
@@ -167,16 +161,12 @@ app.post('/webhook/google-chat', async (req, res) => {
       console.log('✅ Guardado en Notion:', notionPage.id);
     }
 
-    // Construir respuesta con detalles
     const respuesta = buildRespuesta(clasificacion, resultados);
-    await enviarMensajeChat(spaceId, respuesta);
+    return res.status(200).json({ text: respuesta });
 
   } catch (error) {
     console.error('❌ Error en webhook:', error);
-    const spaceId = req.body?.message?.space?.name;
-    if (spaceId) {
-      await enviarMensajeChat(spaceId, `❌ Error interno: ${error.message}`);
-    }
+    return res.status(200).json({ text: `❌ Error interno: ${error.message}` });
   }
 });
 
@@ -184,7 +174,7 @@ app.post('/webhook/google-chat', async (req, res) => {
 async function clasificarConClaude(texto) {
   try {
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 1500,
       system: SYSTEM_PROMPT,
       messages: [
@@ -308,95 +298,55 @@ async function buscarProyecto(nombreProyecto) {
 }
 
 // ─── Plan semanal ─────────────────────────────────────────────────────────────
-async function procesarPlanSemanal(spaceId) {
+async function procesarPlanSemanal() {
   try {
-    await enviarMensajeChat(spaceId, '📅 _Analizando tus tareas para armar el plan semanal..._');
-
-    // Obtener tareas pendientes de Notion
     const tareas = await obtenerTareasPendientes();
+    if (tareas.length === 0) return '✅ No tenés tareas pendientes. ¡Inbox vacío!';
 
-    if (tareas.length === 0) {
-      await enviarMensajeChat(spaceId, '✅ No tenés tareas pendientes. ¡Inbox vacío!');
-      return;
-    }
-
-    // Pedir a Claude que arme el plan
     const planResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 2000,
       messages: [{
         role: 'user',
-        content: `Sos el asistente GTD de Lucas Laurenzano. 
-        
-Tenés estas tareas pendientes en Notion:
-${JSON.stringify(tareas, null, 2)}
-
-Armá un plan semanal concreto siguiendo el sistema GTD:
-1. Identificá las 3 metas principales de la semana
-2. Asigná la ROCA del lunes (la tarea más importante)
-3. Distribuí tareas por contexto y energía
-4. Alertá si hay más de 5 proyectos activos
-
-Respondé en texto plano conciso, con emojis para mejor lectura en Google Chat.
-Máximo 300 palabras.`
+        content: `Sos el asistente GTD de Lucas Laurenzano. Tenés estas tareas pendientes:\n${JSON.stringify(tareas, null, 2)}\n\nArmá un plan semanal concreto: 3 metas principales, ROCA del lunes, tareas por contexto. Alertá si hay más de 5 proyectos activos. Texto plano con emojis, máximo 300 palabras.`
       }]
     });
 
-    await enviarMensajeChat(spaceId, `📅 *Plan Semanal*\n\n${planResponse.content[0].text}`);
-
+    return `📅 *Plan Semanal*\n\n${planResponse.content[0].text}`;
   } catch (error) {
-    await enviarMensajeChat(spaceId, `❌ Error al armar plan semanal: ${error.message}`);
+    return `❌ Error al armar plan semanal: ${error.message}`;
   }
 }
 
 // ─── Plan de hoy ──────────────────────────────────────────────────────────────
-async function procesarPlanHoy(spaceId) {
+async function procesarPlanHoy() {
   try {
-    await enviarMensajeChat(spaceId, '☀️ _Armando tu plan para hoy..._');
-
     const hoy = new Date().toISOString().split('T')[0];
     const tareas = await obtenerTareasHoy(hoy);
-
-    if (tareas.length === 0) {
-      await enviarMensajeChat(spaceId, '📭 No tenés tareas programadas para hoy. Usá /inbox para ver todo lo pendiente.');
-      return;
-    }
+    if (tareas.length === 0) return '📭 No tenés tareas programadas para hoy. Usá /inbox para ver todo lo pendiente.';
 
     const planResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 1000,
       messages: [{
         role: 'user',
-        content: `Sos el asistente GTD de Lucas. Estas son sus tareas para hoy (${hoy}):
-${JSON.stringify(tareas, null, 2)}
-
-Hacé un briefing de día conciso:
-- La ROCA del día (si hay)
-- Tareas por contexto
-- Recordatorios de fechas límite
-Respondé en texto para Google Chat, máximo 200 palabras.`
+        content: `Sos el asistente GTD de Lucas. Tareas para hoy (${hoy}):\n${JSON.stringify(tareas, null, 2)}\n\nBriefing conciso: ROCA del día, tareas por contexto, fechas límite. Máximo 200 palabras.`
       }]
     });
 
-    await enviarMensajeChat(spaceId, `☀️ *Plan de hoy (${hoy})*\n\n${planResponse.content[0].text}`);
-
+    return `☀️ *Plan de hoy (${hoy})*\n\n${planResponse.content[0].text}`;
   } catch (error) {
-    await enviarMensajeChat(spaceId, `❌ Error al armar plan del día: ${error.message}`);
+    return `❌ Error al armar plan del día: ${error.message}`;
   }
 }
 
 // ─── Resumen inbox ────────────────────────────────────────────────────────────
-async function procesarResumenInbox(spaceId) {
+async function procesarResumenInbox() {
   try {
     const tareas = await obtenerTareasPendientes();
     const total = tareas.length;
+    if (total === 0) return '✅ *Inbox vacío.* ¡Estás al día!';
 
-    if (total === 0) {
-      await enviarMensajeChat(spaceId, '✅ *Inbox vacío.* ¡Estás al día!');
-      return;
-    }
-
-    // Agrupar por contexto
     const porContexto = {};
     tareas.forEach(t => {
       const ctx = t.contexto || 'Sin contexto';
@@ -405,17 +355,13 @@ async function procesarResumenInbox(spaceId) {
     });
 
     let msg = `📋 *Inbox — ${total} tarea${total !== 1 ? 's' : ''} pendiente${total !== 1 ? 's' : ''}*\n\n`;
-    Object.entries(porContexto)
-      .sort((a, b) => b[1] - a[1])
-      .forEach(([ctx, count]) => {
-        msg += `• ${ctx}: ${count}\n`;
-      });
-
+    Object.entries(porContexto).sort((a, b) => b[1] - a[1]).forEach(([ctx, count]) => {
+      msg += `• ${ctx}: ${count}\n`;
+    });
     msg += `\nUsá /semana para armar el plan semanal o /hoy para ver el día.`;
-    await enviarMensajeChat(spaceId, msg);
-
+    return msg;
   } catch (error) {
-    await enviarMensajeChat(spaceId, `❌ Error al leer inbox: ${error.message}`);
+    return `❌ Error al leer inbox: ${error.message}`;
   }
 }
 
@@ -428,8 +374,20 @@ async function obtenerTareasPendientes() {
         { property: 'Hecho', checkbox: { equals: false } },
         {
           or: [
-            { property: 'Contexto', select: { does_not_equal: 'algún día/ a lo mejor' } },
-            { property: 'Contexto', select: { does_not_equal: 'T algún día/ a lo mejor' } }
+            { property: 'Contexto', select: { is_empty: true } },
+            { property: 'Contexto', select: { equals: 'ROCA' } },
+            { property: 'Contexto', select: { equals: 'T ROCA' } },
+            { property: 'Contexto', select: { equals: 'Ordenador' } },
+            { property: 'Contexto', select: { equals: 'T Ordenador' } },
+            { property: 'Contexto', select: { equals: '< 5 min' } },
+            { property: 'Contexto', select: { equals: 'T < 5 min' } },
+            { property: 'Contexto', select: { equals: 'Tarea manual casa' } },
+            { property: 'Contexto', select: { equals: 'Energía baja' } },
+            { property: 'Contexto', select: { equals: 'Tarea fuera de casa' } },
+            { property: 'Contexto', select: { equals: 'Leer/Revisar' } },
+            { property: 'Contexto', select: { equals: 'T Leer/ Revisar' } },
+            { property: 'Contexto', select: { equals: 'T Tarea manual oficina' } },
+            { property: 'Contexto', select: { equals: 'T Tarea fuera oficina' } }
           ]
         }
       ]
@@ -540,5 +498,5 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Segundo Cerebro Bot v2.0 corriendo en puerto ${PORT}`);
   console.log(`📋 Notion DB: ${NOTION_DB_ID}`);
-  console.log(`🤖 Claude: claude-sonnet-4-20250514`);
+  console.log(`🤖 Claude: claude-haiku-4-5-20251001`);
 });
