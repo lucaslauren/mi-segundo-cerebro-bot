@@ -180,7 +180,7 @@ async function clasificarConClaude(texto) {
       messages: [
         {
           role: 'user',
-          content: `Clasificá esta entrada de Lucas en su sistema GTD:\n\n"${texto}"`
+          content: `Fecha y hora actual: ${new Date().toLocaleDateString('es-AR', {timeZone: 'America/Argentina/Buenos_Aires', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'})}\n\nClasificá esta entrada de Lucas en su sistema GTD:\n\n"${texto}"`
         }
       ]
     });
