@@ -1,371 +1,503 @@
 /**
- * SEGUNDO CEREBRO BOT - Cloud Run
- * 
- * Sistema GTD completo integrado con Claude AI + Notion
- * Flujo: Google Chat → Cloud Run → Claude → Notion → Respuesta en Chat
- * 
- * Contextos válidos (con T = Trabajo, sin T = Personal):
- * ROCA, T ROCA, Ordenador, T Ordenador, < 5 min, T < 5 min,
- * Tarea manual casa, Energía baja, algún día/ a lo mejor,
- * T algún día/ a lo mejor, Tarea fuera de casa, Leer/Revisar,
- * T Leer/ Revisar, T Tarea manual oficina, T Tarea fuera oficina
+ * SEGUNDO CEREBRO BOT v3.0
+ * Secretario personal de Lucas Hernán Laurenzano
+ *
+ * Capacidades:
+ * - Crear tareas en Notion con clasificación GTD
+ * - Consultar tareas (hoy, mañana, semana, por proyecto)
+ * - Marcar tareas como hechas
+ * - Editar tareas existentes
+ * - Crear/consultar/modificar eventos en Google Calendar
+ * - Plan del día y plan semanal
  */
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const Anthropic = require('@anthropic-ai/sdk');
 const { Client } = require('@notionhq/client');
+const { google } = require('googleapis');
 require('dotenv').config();
 
 const app = express();
 app.use(bodyParser.json({ limit: '10mb' }));
 
-// ─── Clientes ───────────────────────────────────────────────────────────────
+// ─── Clientes ────────────────────────────────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 const NOTION_DB_ID = process.env.NOTION_DATABASE_ID;
-const GOOGLE_CHAT_KEY = process.env.GOOGLE_CHAT_KEY;
-const GOOGLE_CHAT_TOKEN = process.env.GOOGLE_CHAT_TOKEN;
+const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || 'lucas@dlaurenzano.com';
 
-// ─── Contexto del sistema para Claude ───────────────────────────────────────
-const SYSTEM_PROMPT = `Sos el asistente personal de Lucas Hernán Laurenzano, CEO de DLP (Daniel Laurenzano Propiedades), 
-co-fundador de Smart Developments, y socio en Tuluka/gym. Vivís dentro de su sistema GTD en Notion.
+// ─── Google Calendar (Service Account) ───────────────────────────────────────
+function getCalendarClient() {
+  try {
+    const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}';
+    const credentials = JSON.parse(raw);
+    if (!credentials.client_email) return null;
+    const auth = new google.auth.JWT(
+      credentials.client_email,
+      null,
+      credentials.private_key,
+      ['https://www.googleapis.com/auth/calendar']
+    );
+    return google.calendar({ version: 'v3', auth });
+  } catch (e) {
+    console.error('⚠️ Calendar no configurado:', e.message);
+    return null;
+  }
+}
 
-TU ÚNICA FUNCIÓN es analizar mensajes de Lucas y clasificarlos en el sistema GTD. 
-Respondés SIEMPRE en JSON válido y nada más. Sin texto adicional. Sin markdown.
+// ─── Helpers de fecha ─────────────────────────────────────────────────────────
+function fechaHoy() {
+  return new Date().toLocaleDateString('es-AR', {
+    timeZone: 'America/Argentina/Buenos_Aires',
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+  });
+}
 
-SISTEMA GTD DE LUCAS:
-- Todo mensaje es un "ciclo abierto" que debe descargarse y clasificarse
-- Una tarea válida = acción física concreta (ej: "Llamar a Marian re: CUPULA" NO "tema CUPULA")
-- Si la tarea tarda menos de 2 minutos → indicarlo en notas para que la haga ahora
-- Máximo 5 proyectos activos simultáneos
+function fechaISO() {
+  return new Date().toLocaleDateString('en-CA', {
+    timeZone: 'America/Argentina/Buenos_Aires'
+  });
+}
 
-PROYECTOS ACTIVOS DE LUCAS:
-- SDVL | N3302 (Smart Developments - edificio N3302)
+function sumarHora(horaStr, horas) {
+  const [h, m] = horaStr.split(':').map(Number);
+  const d = new Date();
+  d.setHours(h + horas, m, 0);
+  return d.toTimeString().substring(0, 5);
+}
+
+// ─── System prompt ────────────────────────────────────────────────────────────
+function buildSystemPrompt() {
+  return `Sos el secretario personal IA de Lucas Hernán Laurenzano.
+Lucas es CEO de DLP (Daniel Laurenzano Propiedades), co-fundador de Smart Developments SRL, y socio en Tuluka (gym). Vive en Buenos Aires con Julia y su hijo Vito.
+
+TU ROL: Sos su cerebro externo. Manejás su sistema GTD en Notion y su calendario. Lucas no tiene que mirar Notion ni Calendar — vos le decís todo lo que necesita y ejecutás lo que pide.
+
+FECHA ACTUAL: ${fechaHoy()}
+
+═══ PROYECTOS ACTIVOS ═══
+- SDVL | N3302 (Smart Developments - edificio N3302, Bahía Blanca)
 - LAURENGROUP | Contabilidad
 - DLP | Avances CUPULA
 - SMART | CUPULA + MARIAN
 
-CONTEXTOS DISPONIBLES (elegí el más apropiado):
+═══ CONTEXTOS GTD ═══
 Sin T = Personal | Con T = Trabajo
-- ROCA / T ROCA → tarea de máximo impacto, requiere bloque de 1.5-2hs sin interrupciones
+- ROCA / T ROCA → máximo impacto, bloque 1.5-2hs mañana temprano
 - Ordenador / T Ordenador → requiere computadora
-- < 5 min / T < 5 min → tarea rápida, menos de 5 minutos
-- Tarea manual casa → tarea física en casa
-- Energía baja → tarea que se puede hacer con poco foco
-- algún día/ a lo mejor / T algún día/ a lo mejor → sin urgencia, a futuro
-- Tarea fuera de casa → requiere salir
-- Leer/Revisar / T Leer/ Revisar → lectura o revisión de documento
-- T Tarea manual oficina → tarea física en oficina
-- T Tarea fuera oficina → requiere salir de la oficina
+- < 5 min / T < 5 min → llamada o tarea rápida
+- Tarea manual casa → física en casa
+- Energía baja → poca concentración
+- algún día/ a lo mejor / T algún día/ a lo mejor → sin urgencia
+- Tarea fuera de casa → salir
+- Leer/Revisar / T Leer/ Revisar → leer documento
+- T Tarea manual oficina → física en oficina
+- T Tarea fuera oficina → salir de oficina
 
-REGLAS ESTRICTAS:
-1. Reescribí siempre como acción física: verbo + objeto + contexto opcional
-2. Si menciona una persona esperando respuesta → es "En espera"
-3. Si tiene fecha/hora fija → completá "Dia acción" 
-4. Si es algo que quiere hacer HOY → "me_gustaria_hoy": true
-5. Si el input es ambiguo, inferí la mejor interpretación posible
-6. Si menciona más de una tarea → devolvé un array con todas
+═══ INTENCIONES ═══
+Determiná la intención y devolvé JSON válido sin texto extra ni markdown.
 
-FORMATO DE RESPUESTA (JSON estricto):
-{
-  "tareas": [
-    {
-      "siguiente_accion": "Texto de la acción física reescrita",
-      "contexto": "Uno de los contextos válidos exactamente como está escrito arriba",
-      "proyecto": "Nombre exacto del proyecto o null",
-      "en_espera": "Nombre Persona re: descripción o null",
-      "dia_accion": "YYYY-MM-DD o null",
-      "fecha_limite": "YYYY-MM-DD o null",
-      "me_gustaria_hoy": false,
-      "hecho": false,
-      "url": null,
-      "dos_minutos": false,
-      "nota_clasificacion": "Explicación breve de por qué clasificaste así"
-    }
-  ],
-  "mensaje_confirmacion": "Texto conciso para responder en Google Chat confirmando lo que se guardó"
-}`;
+1. CREAR_TAREA → nueva tarea
+2. MARCAR_HECHA → completar tarea existente
+3. CONSULTAR_TAREAS → qué tiene pendiente
+4. EDITAR_TAREA → modificar tarea existente
+5. CREAR_EVENTO → agendar en calendario
+6. CONSULTAR_CALENDARIO → qué tiene en el calendario
+7. MODIFICAR_EVENTO → cambiar evento
+8. PLAN_DIA → resumen del día
+9. PLAN_SEMANA → plan semanal
+10. CONVERSACION → otro
 
-// ─── Health check ────────────────────────────────────────────────────────────
+═══ FORMATOS JSON ═══
+
+CREAR_TAREA:
+{"intencion":"CREAR_TAREA","tareas":[{"siguiente_accion":"verbo+objeto","contexto":"exacto de la lista","proyecto":"nombre exacto o null","en_espera":"Nombre re: tema o null","dia_accion":"YYYY-MM-DD o null","fecha_limite":"YYYY-MM-DD o null","me_gustaria_hoy":false,"dos_minutos":false}],"respuesta":"confirmación"}
+
+MARCAR_HECHA:
+{"intencion":"MARCAR_HECHA","busqueda":"palabras clave de la tarea","respuesta":"confirmación"}
+
+CONSULTAR_TAREAS:
+{"intencion":"CONSULTAR_TAREAS","filtro":"hoy|mañana|semana|proyecto|todas|en_espera","proyecto":"nombre o null","respuesta":"placeholder"}
+
+EDITAR_TAREA:
+{"intencion":"EDITAR_TAREA","busqueda":"palabras clave","cambios":{"siguiente_accion":null,"contexto":null,"dia_accion":null,"fecha_limite":null,"me_gustaria_hoy":null},"respuesta":"confirmación"}
+
+CREAR_EVENTO:
+{"intencion":"CREAR_EVENTO","evento":{"titulo":"nombre","fecha":"YYYY-MM-DD","hora_inicio":"HH:MM o null","hora_fin":"HH:MM o null","descripcion":null,"todo_el_dia":false},"respuesta":"confirmación"}
+
+CONSULTAR_CALENDARIO:
+{"intencion":"CONSULTAR_CALENDARIO","periodo":"hoy|mañana|semana","respuesta":"placeholder"}
+
+MODIFICAR_EVENTO:
+{"intencion":"MODIFICAR_EVENTO","busqueda":"palabras clave","cambios":{"titulo":null,"fecha":null,"hora_inicio":null,"hora_fin":null},"respuesta":"confirmación"}
+
+PLAN_DIA:
+{"intencion":"PLAN_DIA","respuesta":"placeholder"}
+
+PLAN_SEMANA:
+{"intencion":"PLAN_SEMANA","respuesta":"placeholder"}
+
+CONVERSACION:
+{"intencion":"CONVERSACION","respuesta":"respuesta útil como secretario"}`;
+}
+
+// ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'running', version: '2.0.0' });
+  res.status(200).json({ status: 'running', version: '3.0.0' });
 });
 
-// ─── Webhook principal de Google Chat ────────────────────────────────────────
+// ─── Webhook ──────────────────────────────────────────────────────────────────
 app.post('/webhook/google-chat', async (req, res) => {
-  console.log('📨 Mensaje recibido:', JSON.stringify(req.body, null, 2));
-
   try {
     const body = req.body;
-
-    // Google Chat nueva API: body.chat.messagePayload.message
-    // Google Chat legacy: body.message
-    let message = body.message || body.chat?.messagePayload?.message;
-
-    if (!message) {
-      console.log('⚠️ No se encontró message en el body');
-      return res.status(200).json({ text: '⚠️ Mensaje no reconocido.' });
-    }
-
-    // Ignorar mensajes del propio bot
-    if (message.sender?.type === 'BOT') {
-      return res.status(200).json({ ok: true });
-    }
+    const message = body.message || body.chat?.messagePayload?.message;
+    if (!message) return res.status(200).json({ text: '⚠️ Mensaje no reconocido.' });
+    if (message.sender?.type === 'BOT') return res.status(200).json({ ok: true });
 
     const userText = message.text?.trim() || message.argumentText?.trim();
-    const attachments = message.attachment || [];
+    if (!userText) return res.status(200).json({ ok: true });
 
-    // ── Comandos especiales ──────────────────────────────────────────────────
-    if (userText?.toLowerCase() === '/semana') {
-      const resp = await procesarPlanSemanal();
-      return res.status(200).json({ text: resp });
-    }
+    console.log('💬 Lucas:', userText);
 
-    if (userText?.toLowerCase() === '/inbox') {
-      const resp = await procesarResumenInbox();
-      return res.status(200).json({ text: resp });
-    }
+    const resultado = await procesarIntencion(userText);
+    const respuesta = await ejecutarIntencion(resultado);
 
-    if (userText?.toLowerCase() === '/hoy') {
-      const resp = await procesarPlanHoy();
-      return res.status(200).json({ text: resp });
-    }
-
-    if (userText?.toLowerCase() === '/ayuda') {
-      return res.status(200).json({ text: getMensajeAyuda() });
-    }
-
-    // ── Procesar audio (adjunto) ─────────────────────────────────────────────
-    if (attachments.length > 0) {
-      return res.status(200).json({ text: '🎙️ Audio recibido. La transcripción de voz está en desarrollo — por ahora mandá el texto directamente.' });
-    }
-
-    // ── Procesar mensaje de texto ────────────────────────────────────────────
-    if (!userText) {
-      return res.status(200).json({ ok: true });
-    }
-
-    // Clasificar con Claude y guardar en Notion
-    const clasificacion = await clasificarConClaude(userText);
-
-    if (!clasificacion || !clasificacion.tareas?.length) {
-      return res.status(200).json({ text: '❌ No pude clasificar eso. Probá con una tarea más específica.' });
-    }
-
-    const resultados = [];
-    for (const tarea of clasificacion.tareas) {
-      const notionPage = await guardarEnNotion(tarea);
-      resultados.push({ tarea, notionPage });
-      console.log('✅ Guardado en Notion:', notionPage.id);
-    }
-
-    const respuesta = buildRespuesta(clasificacion, resultados);
     return res.status(200).json({ text: respuesta });
-
   } catch (error) {
-    console.error('❌ Error en webhook:', error);
-    return res.status(200).json({ text: `❌ Error interno: ${error.message}` });
+    console.error('❌ Error:', error);
+    return res.status(200).json({ text: `❌ Error: ${error.message}` });
   }
 });
 
-// ─── Clasificar con Claude ────────────────────────────────────────────────────
-async function clasificarConClaude(texto) {
-  try {
-    const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1500,
-      system: SYSTEM_PROMPT,
-      messages: [
-        {
-          role: 'user',
-          content: `Fecha y hora actual: ${new Date().toLocaleDateString('es-AR', {timeZone: 'America/Argentina/Buenos_Aires', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'})}\n\nClasificá esta entrada de Lucas en su sistema GTD:\n\n"${texto}"`
-        }
-      ]
-    });
-
-    const raw = response.content[0].text.trim();
-    console.log('🤖 Claude respondió:', raw);
-
-    // Limpiar posibles markdown fences
-    const clean = raw.replace(/```json|```/g, '').trim();
-    return JSON.parse(clean);
-
-  } catch (error) {
-    console.error('❌ Error en Claude:', error);
-    throw new Error(`Claude falló: ${error.message}`);
-  }
-}
-
-// ─── Guardar en Notion ────────────────────────────────────────────────────────
-async function guardarEnNotion(tarea) {
-  const properties = {
-    'Siguiente acción': {
-      title: [{ text: { content: tarea.siguiente_accion } }]
-    }
-  };
-
-  // Contexto
-  if (tarea.contexto) {
-    properties['Contexto'] = {
-      select: { name: tarea.contexto }
-    };
-  }
-
-  // Fecha de acción
-  if (tarea.dia_accion) {
-    properties['Dia acción'] = {
-      date: { start: tarea.dia_accion }
-    };
-  }
-
-  // Fecha límite
-  if (tarea.fecha_limite) {
-    properties['Fecha límite'] = {
-      date: { start: tarea.fecha_limite }
-    };
-  }
-
-  // Me gustaría hoy
-  if (tarea.me_gustaria_hoy) {
-    properties['Me gustaría hoy'] = {
-      checkbox: true
-    };
-  }
-
-  // En espera
-  if (tarea.en_espera) {
-    properties['En espera'] = {
-      // En espera puede ser date o rich_text según la DB
-      // Usamos rich_text como fallback seguro
-      rich_text: [{ text: { content: tarea.en_espera } }]
-    };
-  }
-
-  // URL
-  if (tarea.url) {
-    properties['URL'] = {
-      url: tarea.url
-    };
-  }
-
-  // Hecho (siempre false en nueva tarea)
-  properties['Hecho'] = {
-    checkbox: false
-  };
-
-  // Proyecto — búsqueda por nombre para obtener el ID de relación
-  if (tarea.proyecto) {
-    const proyectoId = await buscarProyecto(tarea.proyecto);
-    if (proyectoId) {
-      properties['Proyecto'] = {
-        relation: [{ id: proyectoId }]
-      };
-    }
-  }
-
-  const page = await notion.pages.create({
-    parent: { database_id: NOTION_DB_ID },
-    properties
+// ─── Procesar intención ───────────────────────────────────────────────────────
+async function procesarIntencion(texto) {
+  const response = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 2000,
+    system: buildSystemPrompt(),
+    messages: [{ role: 'user', content: `Mensaje de Lucas: "${texto}"` }]
   });
 
-  return page;
+  const raw = response.content[0].text.trim();
+  console.log('🤖 Claude:', raw);
+  const clean = raw.replace(/```json|```/g, '').trim();
+  return JSON.parse(clean);
 }
 
-// ─── Buscar proyecto por nombre ───────────────────────────────────────────────
-async function buscarProyecto(nombreProyecto) {
-  try {
-    const proyectosDbId = process.env.NOTION_PROJECTS_DATABASE_ID;
-    if (!proyectosDbId) return null;
-
-    const response = await notion.databases.query({
-      database_id: proyectosDbId,
-      filter: {
-        property: 'Título',
-        title: { contains: nombreProyecto.split('|')[1]?.trim() || nombreProyecto }
-      }
-    });
-
-    if (response.results.length > 0) {
-      return response.results[0].id;
-    }
-    return null;
-  } catch (error) {
-    console.error('⚠️ No se pudo buscar proyecto:', error.message);
-    return null;
+// ─── Ejecutar intención ───────────────────────────────────────────────────────
+async function ejecutarIntencion(resultado) {
+  switch (resultado.intencion) {
+    case 'CREAR_TAREA':         return await ejecutarCrearTarea(resultado);
+    case 'MARCAR_HECHA':        return await ejecutarMarcarHecha(resultado);
+    case 'CONSULTAR_TAREAS':    return await ejecutarConsultarTareas(resultado);
+    case 'EDITAR_TAREA':        return await ejecutarEditarTarea(resultado);
+    case 'CREAR_EVENTO':        return await ejecutarCrearEvento(resultado);
+    case 'CONSULTAR_CALENDARIO':return await ejecutarConsultarCalendario(resultado);
+    case 'MODIFICAR_EVENTO':    return await ejecutarModificarEvento(resultado);
+    case 'PLAN_DIA':            return await ejecutarPlanDia();
+    case 'PLAN_SEMANA':         return await ejecutarPlanSemana();
+    case 'CONVERSACION':        return resultado.respuesta;
+    default:                    return resultado.respuesta || '¿Podés ser más específico?';
   }
 }
 
-// ─── Plan semanal ─────────────────────────────────────────────────────────────
-async function procesarPlanSemanal() {
-  try {
-    const tareas = await obtenerTareasPendientes();
-    if (tareas.length === 0) return '✅ No tenés tareas pendientes. ¡Inbox vacío!';
+// ─── CREAR TAREA ──────────────────────────────────────────────────────────────
+async function ejecutarCrearTarea(resultado) {
+  const tareas = resultado.tareas || [];
+  if (!tareas.length) return '❌ No pude identificar la tarea.';
 
-    const planResponse = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 2000,
-      messages: [{
-        role: 'user',
-        content: `Sos el asistente GTD de Lucas Laurenzano. Tenés estas tareas pendientes:\n${JSON.stringify(tareas, null, 2)}\n\nArmá un plan semanal concreto: 3 metas principales, ROCA del lunes, tareas por contexto. Alertá si hay más de 5 proyectos activos. Texto plano con emojis, máximo 300 palabras.`
-      }]
-    });
-
-    return `📅 *Plan Semanal*\n\n${planResponse.content[0].text}`;
-  } catch (error) {
-    return `❌ Error al armar plan semanal: ${error.message}`;
+  const creadas = [];
+  for (const tarea of tareas) {
+    const page = await guardarEnNotion(tarea);
+    creadas.push({ tarea, id: page.id });
+    console.log('✅ Notion:', page.id);
   }
-}
 
-// ─── Plan de hoy ──────────────────────────────────────────────────────────────
-async function procesarPlanHoy() {
-  try {
-    const hoy = new Date().toISOString().split('T')[0];
-    const tareas = await obtenerTareasHoy(hoy);
-    if (tareas.length === 0) return '📭 No tenés tareas programadas para hoy. Usá /inbox para ver todo lo pendiente.';
-
-    const planResponse = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1000,
-      messages: [{
-        role: 'user',
-        content: `Sos el asistente GTD de Lucas. Tareas para hoy (${hoy}):\n${JSON.stringify(tareas, null, 2)}\n\nBriefing conciso: ROCA del día, tareas por contexto, fechas límite. Máximo 200 palabras.`
-      }]
-    });
-
-    return `☀️ *Plan de hoy (${hoy})*\n\n${planResponse.content[0].text}`;
-  } catch (error) {
-    return `❌ Error al armar plan del día: ${error.message}`;
-  }
-}
-
-// ─── Resumen inbox ────────────────────────────────────────────────────────────
-async function procesarResumenInbox() {
-  try {
-    const tareas = await obtenerTareasPendientes();
-    const total = tareas.length;
-    if (total === 0) return '✅ *Inbox vacío.* ¡Estás al día!';
-
-    const porContexto = {};
-    tareas.forEach(t => {
-      const ctx = t.contexto || 'Sin contexto';
-      if (!porContexto[ctx]) porContexto[ctx] = 0;
-      porContexto[ctx]++;
-    });
-
-    let msg = `📋 *Inbox — ${total} tarea${total !== 1 ? 's' : ''} pendiente${total !== 1 ? 's' : ''}*\n\n`;
-    Object.entries(porContexto).sort((a, b) => b[1] - a[1]).forEach(([ctx, count]) => {
-      msg += `• ${ctx}: ${count}\n`;
-    });
-    msg += `\nUsá /semana para armar el plan semanal o /hoy para ver el día.`;
+  if (creadas.length === 1) {
+    const t = creadas[0].tarea;
+    let msg = `✅ *Guardado*\n📌 ${t.siguiente_accion}`;
+    if (t.contexto)      msg += `\n🏷️ ${t.contexto}`;
+    if (t.proyecto)      msg += `\n📁 ${t.proyecto}`;
+    if (t.dia_accion)    msg += `\n📅 ${t.dia_accion}`;
+    if (t.dos_minutos)   msg += `\n⚡ *Menos de 2 min — hacelo ahora*`;
+    if (t.en_espera)     msg += `\n⏳ En espera: ${t.en_espera}`;
     return msg;
-  } catch (error) {
-    return `❌ Error al leer inbox: ${error.message}`;
   }
+
+  let msg = `✅ *${creadas.length} tareas guardadas*\n`;
+  creadas.forEach((c, i) => {
+    msg += `\n${i + 1}. ${c.tarea.siguiente_accion}`;
+    if (c.tarea.contexto) msg += ` (${c.tarea.contexto})`;
+  });
+  return msg;
 }
 
-// ─── Obtener tareas pendientes de Notion ──────────────────────────────────────
+// ─── MARCAR HECHA ─────────────────────────────────────────────────────────────
+async function ejecutarMarcarHecha(resultado) {
+  const tareas = await buscarTareasPorTexto(resultado.busqueda);
+  if (!tareas.length) return `❌ No encontré tarea con "${resultado.busqueda}". ¿Podés ser más específico?`;
+
+  const tarea = tareas[0];
+  await notion.pages.update({
+    page_id: tarea.id,
+    properties: { 'Hecho': { checkbox: true } }
+  });
+
+  console.log('✅ Marcada hecha:', tarea.titulo);
+  return `✅ Listo — *"${tarea.titulo}"* marcada como hecha.`;
+}
+
+// ─── CONSULTAR TAREAS ─────────────────────────────────────────────────────────
+async function ejecutarConsultarTareas(resultado) {
+  const { filtro, proyecto } = resultado;
+  const hoy = fechaISO();
+  let tareas = [];
+  let titulo = '';
+
+  if (filtro === 'hoy') {
+    tareas = await obtenerTareasFecha(hoy);
+    titulo = `☀️ *Tareas para hoy*`;
+  } else if (filtro === 'mañana') {
+    const d = new Date(); d.setDate(d.getDate() + 1);
+    const manana = d.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
+    tareas = await obtenerTareasFecha(manana);
+    titulo = `📅 *Tareas para mañana (${manana})*`;
+  } else if (filtro === 'semana') {
+    tareas = await obtenerTareasSemana();
+    titulo = `📋 *Tareas esta semana*`;
+  } else if (filtro === 'proyecto' && proyecto) {
+    tareas = await obtenerTareasPorProyecto(proyecto);
+    titulo = `📁 *${proyecto}*`;
+  } else if (filtro === 'en_espera') {
+    tareas = await obtenerTareasEnEspera();
+    titulo = `⏳ *En espera*`;
+  } else {
+    tareas = await obtenerTareasPendientes();
+    titulo = `📋 *Todas las pendientes*`;
+  }
+
+  if (!tareas.length) return `${titulo}\n\n_Nada pendiente._`;
+
+  let msg = `${titulo} — ${tareas.length}\n`;
+  tareas.forEach((t, i) => {
+    msg += `\n${i + 1}. ${t.titulo}`;
+    if (t.contexto)   msg += ` _(${t.contexto})_`;
+    if (t.dia_accion) msg += ` — ${t.dia_accion}`;
+    if (t.en_espera)  msg += ` ⏳`;
+  });
+  return msg;
+}
+
+// ─── EDITAR TAREA ─────────────────────────────────────────────────────────────
+async function ejecutarEditarTarea(resultado) {
+  const { busqueda, cambios } = resultado;
+  const tareas = await buscarTareasPorTexto(busqueda);
+  if (!tareas.length) return `❌ No encontré tarea con "${busqueda}".`;
+
+  const tarea = tareas[0];
+  const properties = {};
+
+  if (cambios.siguiente_accion) properties['Siguiente acción'] = { title: [{ text: { content: cambios.siguiente_accion } }] };
+  if (cambios.contexto)         properties['Contexto'] = { select: { name: cambios.contexto } };
+  if (cambios.dia_accion)       properties['Dia acción'] = { date: { start: cambios.dia_accion } };
+  if (cambios.fecha_limite)     properties['Fecha límite'] = { date: { start: cambios.fecha_limite } };
+  if (cambios.me_gustaria_hoy !== null && cambios.me_gustaria_hoy !== undefined) {
+    properties['Me gustaría hoy'] = { checkbox: cambios.me_gustaria_hoy };
+  }
+
+  await notion.pages.update({ page_id: tarea.id, properties });
+  console.log('✏️ Editada:', tarea.titulo);
+  return `✏️ *Actualizado* — "${tarea.titulo}" modificada.`;
+}
+
+// ─── CREAR EVENTO ─────────────────────────────────────────────────────────────
+async function ejecutarCrearEvento(resultado) {
+  const cal = getCalendarClient();
+  if (!cal) return `⚠️ Calendario no configurado. Avisale a Lucas que agregue GOOGLE_SERVICE_ACCOUNT_JSON a las variables de Cloud Run.`;
+
+  const { evento } = resultado;
+  let eventBody = { summary: evento.titulo, description: evento.descripcion || '' };
+
+  if (evento.todo_el_dia || !evento.hora_inicio) {
+    eventBody.start = { date: evento.fecha };
+    eventBody.end = { date: evento.fecha };
+  } else {
+    const fin = evento.hora_fin || sumarHora(evento.hora_inicio, 1);
+    eventBody.start = { dateTime: `${evento.fecha}T${evento.hora_inicio}:00`, timeZone: 'America/Argentina/Buenos_Aires' };
+    eventBody.end = { dateTime: `${evento.fecha}T${fin}:00`, timeZone: 'America/Argentina/Buenos_Aires' };
+  }
+
+  const resp = await cal.events.insert({ calendarId: CALENDAR_ID, requestBody: eventBody });
+  console.log('📅 Evento creado:', resp.data.id);
+
+  let msg = `📅 *Agendado*\n📌 ${evento.titulo}\n📆 ${evento.fecha}`;
+  if (evento.hora_inicio) msg += ` a las ${evento.hora_inicio}`;
+  return msg;
+}
+
+// ─── CONSULTAR CALENDARIO ────────────────────────────────────────────────────
+async function ejecutarConsultarCalendario(resultado) {
+  const cal = getCalendarClient();
+  if (!cal) return `⚠️ Calendario no configurado todavía.`;
+
+  const { periodo } = resultado;
+  const ahora = new Date(); ahora.setHours(0, 0, 0, 0);
+  let timeMin = ahora.toISOString();
+  let timeMax;
+  let titulo;
+
+  if (periodo === 'hoy') {
+    const fin = new Date(ahora); fin.setHours(23, 59, 59);
+    timeMax = fin.toISOString();
+    titulo = '☀️ *Calendario hoy*';
+  } else if (periodo === 'mañana') {
+    const man = new Date(ahora); man.setDate(man.getDate() + 1);
+    timeMin = man.toISOString();
+    const finMan = new Date(man); finMan.setHours(23, 59, 59);
+    timeMax = finMan.toISOString();
+    titulo = '📅 *Calendario mañana*';
+  } else {
+    const en7 = new Date(ahora); en7.setDate(en7.getDate() + 7);
+    timeMax = en7.toISOString();
+    titulo = '📋 *Calendario esta semana*';
+  }
+
+  const resp = await cal.events.list({ calendarId: CALENDAR_ID, timeMin, timeMax, singleEvents: true, orderBy: 'startTime', maxResults: 20 });
+  const eventos = resp.data.items || [];
+  if (!eventos.length) return `${titulo}\n\n_Sin eventos._`;
+
+  let msg = `${titulo} — ${eventos.length} evento${eventos.length !== 1 ? 's' : ''}\n`;
+  eventos.forEach((e, i) => {
+    const hora = e.start.dateTime
+      ? new Date(e.start.dateTime).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Argentina/Buenos_Aires' })
+      : 'Todo el día';
+    msg += `\n${i + 1}. ${e.summary} — ${hora}`;
+  });
+  return msg;
+}
+
+// ─── MODIFICAR EVENTO ────────────────────────────────────────────────────────
+async function ejecutarModificarEvento(resultado) {
+  const cal = getCalendarClient();
+  if (!cal) return `⚠️ Calendario no configurado todavía.`;
+
+  const { busqueda, cambios } = resultado;
+  const ahora = new Date();
+  const en30 = new Date(); en30.setDate(en30.getDate() + 30);
+
+  const resp = await cal.events.list({ calendarId: CALENDAR_ID, timeMin: ahora.toISOString(), timeMax: en30.toISOString(), q: busqueda, singleEvents: true, maxResults: 5 });
+  const eventos = resp.data.items || [];
+  if (!eventos.length) return `❌ No encontré evento con "${busqueda}" en los próximos 30 días.`;
+
+  const evento = eventos[0];
+  const patch = {};
+  if (cambios.titulo) patch.summary = cambios.titulo;
+  if (cambios.fecha || cambios.hora_inicio) {
+    const fecha = cambios.fecha || evento.start.dateTime?.split('T')[0] || evento.start.date;
+    const hora  = cambios.hora_inicio || evento.start.dateTime?.split('T')[1]?.substring(0, 5) || '09:00';
+    const fin   = cambios.hora_fin || sumarHora(hora, 1);
+    patch.start = { dateTime: `${fecha}T${hora}:00`, timeZone: 'America/Argentina/Buenos_Aires' };
+    patch.end   = { dateTime: `${fecha}T${fin}:00`,  timeZone: 'America/Argentina/Buenos_Aires' };
+  }
+
+  await cal.events.patch({ calendarId: CALENDAR_ID, eventId: evento.id, requestBody: patch });
+  console.log('✏️ Evento editado:', evento.summary);
+  return `✏️ *Actualizado* — "${evento.summary}" modificado.`;
+}
+
+// ─── PLAN DEL DÍA ────────────────────────────────────────────────────────────
+async function ejecutarPlanDia() {
+  const hoy = fechaISO();
+  const [tareas, eventos] = await Promise.all([
+    obtenerTareasFecha(hoy),
+    obtenerEventosCalendarioRaw('hoy')
+  ]);
+
+  let ctx = `Fecha: ${fechaHoy()}\n\n`;
+  if (eventos.length) {
+    ctx += `AGENDA HOY:\n`;
+    eventos.forEach(e => { ctx += `- ${e.hora}: ${e.titulo}\n`; });
+    ctx += '\n';
+  }
+  ctx += `TAREAS PENDIENTES HOY:\n`;
+  if (tareas.length) tareas.forEach(t => { ctx += `- [${t.contexto || 'sin contexto'}] ${t.titulo}\n`; });
+  else ctx += '- Sin tareas específicas para hoy\n';
+
+  const resp = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 800,
+    messages: [{ role: 'user', content: `Sos el secretario de Lucas. Armá un briefing del día conciso. Empezá con la ROCA si hay. Máximo 200 palabras con emojis.\n\n${ctx}` }]
+  });
+
+  return `☀️ *Plan de hoy*\n\n${resp.content[0].text}`;
+}
+
+// ─── PLAN SEMANAL ────────────────────────────────────────────────────────────
+async function ejecutarPlanSemana() {
+  const [tareas, eventos] = await Promise.all([
+    obtenerTareasSemana(),
+    obtenerEventosCalendarioRaw('semana')
+  ]);
+
+  let ctx = `Fecha: ${fechaHoy()}\n\n`;
+  if (eventos.length) {
+    ctx += `AGENDA SEMANA:\n`;
+    eventos.forEach(e => { ctx += `- ${e.fecha} ${e.hora}: ${e.titulo}\n`; });
+    ctx += '\n';
+  }
+  ctx += `TAREAS SEMANA:\n`;
+  tareas.forEach(t => {
+    ctx += `- [${t.contexto || 'sin ctx'}] ${t.titulo}`;
+    if (t.dia_accion) ctx += ` (${t.dia_accion})`;
+    ctx += '\n';
+  });
+
+  const resp = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 1000,
+    messages: [{ role: 'user', content: `Sos el secretario de Lucas. Armá un plan semanal: 3 metas, ROCA del lunes, tareas por día. Máximo 350 palabras.\n\n${ctx}` }]
+  });
+
+  return `📅 *Plan Semanal*\n\n${resp.content[0].text}`;
+}
+
+// ─── GUARDAR EN NOTION ────────────────────────────────────────────────────────
+async function guardarEnNotion(tarea) {
+  const properties = {
+    'Siguiente acción': { title: [{ text: { content: tarea.siguiente_accion } }] },
+    'Hecho': { checkbox: false }
+  };
+  if (tarea.contexto)        properties['Contexto'] = { select: { name: tarea.contexto } };
+  if (tarea.dia_accion)      properties['Dia acción'] = { date: { start: tarea.dia_accion } };
+  if (tarea.fecha_limite)    properties['Fecha límite'] = { date: { start: tarea.fecha_limite } };
+  if (tarea.me_gustaria_hoy) properties['Me gustaría hoy'] = { checkbox: true };
+  if (tarea.en_espera)       properties['En espera'] = { rich_text: [{ text: { content: tarea.en_espera } }] };
+  if (tarea.url)             properties['URL'] = { url: tarea.url };
+
+  return await notion.pages.create({ parent: { database_id: NOTION_DB_ID }, properties });
+}
+
+// ─── BUSCAR TAREAS POR TEXTO ──────────────────────────────────────────────────
+async function buscarTareasPorTexto(busqueda) {
+  const palabras = busqueda.split(' ').filter(p => p.length > 3);
+  const keyword = palabras[0] || busqueda;
+
+  const response = await notion.databases.query({
+    database_id: NOTION_DB_ID,
+    filter: {
+      and: [
+        { property: 'Hecho', checkbox: { equals: false } },
+        { property: 'Siguiente acción', title: { contains: keyword } }
+      ]
+    },
+    page_size: 10
+  });
+  return response.results.map(mapTarea);
+}
+
+// ─── OBTENER TAREAS PENDIENTES ────────────────────────────────────────────────
 async function obtenerTareasPendientes() {
   const response = await notion.databases.query({
     database_id: NOTION_DB_ID,
@@ -395,108 +527,119 @@ async function obtenerTareasPendientes() {
     sorts: [{ property: 'Dia acción', direction: 'ascending' }],
     page_size: 50
   });
-
-  return response.results.map(page => ({
-    id: page.id,
-    titulo: page.properties['Siguiente acción']?.title?.[0]?.text?.content || '',
-    contexto: page.properties['Contexto']?.select?.name || null,
-    proyecto: page.properties['Proyecto']?.relation?.[0]?.id || null,
-    dia_accion: page.properties['Dia acción']?.date?.start || null,
-    fecha_limite: page.properties['Fecha límite']?.date?.start || null,
-    me_gustaria_hoy: page.properties['Me gustaría hoy']?.checkbox || false
-  }));
+  return response.results.map(mapTarea);
 }
 
-// ─── Obtener tareas para hoy ──────────────────────────────────────────────────
-async function obtenerTareasHoy(fecha) {
+// ─── OBTENER TAREAS POR FECHA ─────────────────────────────────────────────────
+async function obtenerTareasFecha(fecha) {
   const response = await notion.databases.query({
     database_id: NOTION_DB_ID,
     filter: {
       and: [
         { property: 'Hecho', checkbox: { equals: false } },
-        {
-          or: [
-            { property: 'Me gustaría hoy', checkbox: { equals: true } },
-            { property: 'Dia acción', date: { equals: fecha } }
-          ]
-        }
+        { or: [
+          { property: 'Me gustaría hoy', checkbox: { equals: true } },
+          { property: 'Dia acción', date: { equals: fecha } }
+        ]}
       ]
     }
   });
+  return response.results.map(mapTarea);
+}
 
-  return response.results.map(page => ({
+// ─── OBTENER TAREAS SEMANA ────────────────────────────────────────────────────
+async function obtenerTareasSemana() {
+  const hoy = fechaISO();
+  const en7 = new Date(); en7.setDate(en7.getDate() + 7);
+  const en7ISO = en7.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
+
+  const response = await notion.databases.query({
+    database_id: NOTION_DB_ID,
+    filter: {
+      and: [
+        { property: 'Hecho', checkbox: { equals: false } },
+        { property: 'Dia acción', date: { on_or_after: hoy } },
+        { property: 'Dia acción', date: { on_or_before: en7ISO } }
+      ]
+    },
+    sorts: [{ property: 'Dia acción', direction: 'ascending' }],
+    page_size: 50
+  });
+  return response.results.map(mapTarea);
+}
+
+// ─── OBTENER TAREAS EN ESPERA ─────────────────────────────────────────────────
+async function obtenerTareasEnEspera() {
+  const response = await notion.databases.query({
+    database_id: NOTION_DB_ID,
+    filter: {
+      and: [
+        { property: 'Hecho', checkbox: { equals: false } },
+        { property: 'En espera', rich_text: { is_not_empty: true } }
+      ]
+    }
+  });
+  return response.results.map(mapTarea);
+}
+
+// ─── OBTENER TAREAS POR PROYECTO ──────────────────────────────────────────────
+async function obtenerTareasPorProyecto(nombreProyecto) {
+  const response = await notion.databases.query({
+    database_id: NOTION_DB_ID,
+    filter: { property: 'Hecho', checkbox: { equals: false } },
+    page_size: 100
+  });
+  return response.results.map(mapTarea).filter(t =>
+    t.titulo.toLowerCase().includes(nombreProyecto.toLowerCase())
+  );
+}
+
+// ─── OBTENER EVENTOS CALENDARIO (raw para plan) ───────────────────────────────
+async function obtenerEventosCalendarioRaw(periodo) {
+  try {
+    const cal = getCalendarClient();
+    if (!cal) return [];
+    const ahora = new Date(); ahora.setHours(0, 0, 0, 0);
+    let timeMin = ahora.toISOString();
+    let timeMax;
+    if (periodo === 'hoy') {
+      const fin = new Date(ahora); fin.setHours(23, 59, 59);
+      timeMax = fin.toISOString();
+    } else {
+      const en7 = new Date(ahora); en7.setDate(en7.getDate() + 7);
+      timeMax = en7.toISOString();
+    }
+    const resp = await cal.events.list({ calendarId: CALENDAR_ID, timeMin, timeMax, singleEvents: true, orderBy: 'startTime', maxResults: 20 });
+    return (resp.data.items || []).map(e => ({
+      id: e.id, titulo: e.summary,
+      fecha: e.start.date || e.start.dateTime?.split('T')[0],
+      hora: e.start.dateTime
+        ? new Date(e.start.dateTime).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Argentina/Buenos_Aires' })
+        : 'Todo el día'
+    }));
+  } catch (e) {
+    console.error('⚠️ Calendar error:', e.message);
+    return [];
+  }
+}
+
+// ─── HELPER: mapear página Notion ─────────────────────────────────────────────
+function mapTarea(page) {
+  return {
+    id: page.id,
     titulo: page.properties['Siguiente acción']?.title?.[0]?.text?.content || '',
     contexto: page.properties['Contexto']?.select?.name || null,
-    fecha_limite: page.properties['Fecha límite']?.date?.start || null
-  }));
-}
-
-// ─── Enviar mensaje a Google Chat ─────────────────────────────────────────────
-async function enviarMensajeChat(spaceId, texto) {
-  if (!spaceId) return;
-
-  const url = `https://chat.googleapis.com/v1/${spaceId}/messages?key=${GOOGLE_CHAT_KEY}&token=${GOOGLE_CHAT_TOKEN}`;
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text: texto })
-  });
-
-  if (!response.ok) {
-    console.error('❌ Error enviando a Google Chat:', await response.text());
-  }
-}
-
-// ─── Construir respuesta de confirmación ──────────────────────────────────────
-function buildRespuesta(clasificacion, resultados) {
-  let msg = clasificacion.mensaje_confirmacion || '✅ Tarea guardada en Notion';
-
-  if (resultados.length > 1) {
-    msg = `✅ *${resultados.length} tareas guardadas en Notion*\n\n`;
-    resultados.forEach((r, i) => {
-      msg += `${i + 1}. ${r.tarea.siguiente_accion}`;
-      if (r.tarea.contexto) msg += ` — _${r.tarea.contexto}_`;
-      msg += '\n';
-    });
-  } else if (resultados.length === 1) {
-    const t = resultados[0].tarea;
-    msg = `✅ *Guardado en Notion*\n`;
-    msg += `📌 ${t.siguiente_accion}\n`;
-    if (t.contexto) msg += `🏷️ Contexto: ${t.contexto}\n`;
-    if (t.proyecto) msg += `📁 Proyecto: ${t.proyecto}\n`;
-    if (t.dia_accion) msg += `📅 Día: ${t.dia_accion}\n`;
-    if (t.dos_minutos) msg += `⚡ *Menos de 2 min — hacelo ahora*\n`;
-    if (t.en_espera) msg += `⏳ En espera de: ${t.en_espera}\n`;
-  }
-
-  return msg;
-}
-
-// ─── Mensaje de ayuda ─────────────────────────────────────────────────────────
-function getMensajeAyuda() {
-  return `🧠 *Segundo Cerebro Bot — Comandos*
-
-*Captura de tareas:*
-Escribí cualquier tarea, idea o "tengo que" y la clasifico automáticamente en tu Notion.
-
-*Comandos:*
-• /hoy → Plan del día con tus tareas
-• /semana → Revisión semanal y plan
-• /inbox → Resumen de tareas pendientes por contexto
-• /ayuda → Este mensaje
-
-*Ejemplos de captura:*
-• "Llamar al contador sobre BB4360"
-• "Revisar propuesta CUPULA antes del viernes"
-• "Tengo que comprar ropa para el cumple"
-• "Hablar con Marian re: avances Smart"`;
+    dia_accion: page.properties['Dia acción']?.date?.start || null,
+    fecha_limite: page.properties['Fecha límite']?.date?.start || null,
+    me_gustaria_hoy: page.properties['Me gustaría hoy']?.checkbox || false,
+    en_espera: page.properties['En espera']?.rich_text?.[0]?.text?.content || null
+  };
 }
 
 // ─── Iniciar servidor ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Segundo Cerebro Bot v2.0 corriendo en puerto ${PORT}`);
-  console.log(`📋 Notion DB: ${NOTION_DB_ID}`);
-  console.log(`🤖 Claude: claude-haiku-4-5-20251001`);
+  console.log(`🚀 Segundo Cerebro Bot v3.0 en puerto ${PORT}`);
+  console.log(`📋 Notion: ${NOTION_DB_ID}`);
+  console.log(`📅 Calendar: ${CALENDAR_ID}`);
 });
