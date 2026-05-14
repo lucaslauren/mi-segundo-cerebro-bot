@@ -1,18 +1,18 @@
 {
   "name": "mi-segundo-cerebro-bot",
-  "version": "2.0.0",
-  "description": "Asistente personal GTD — Google Chat + Claude + Notion",
+  "version": "3.0.0",
+  "description": "Secretario personal IA — Google Chat + Claude + Notion + Calendar",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
     "body-parser": "^1.20.2",
     "dotenv": "^16.3.1",
     "@notionhq/client": "^2.2.8",
-    "@anthropic-ai/sdk": "^0.36.0"
+    "@anthropic-ai/sdk": "^0.36.0",
+    "googleapis": "^140.0.0"
   },
   "engines": {
     "node": ">=20"
