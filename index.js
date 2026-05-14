@@ -166,11 +166,15 @@ app.post('/webhook/google-chat', async (req, res) => {
     console.log('💬 Lucas:', userText);
 
     const resultado = await procesarIntencion(userText);
+    console.log('🎯 Intención detectada:', resultado.intencion);
+
     const respuesta = await ejecutarIntencion(resultado);
+    console.log('📤 Respuesta lista, largo:', respuesta?.length);
 
     return res.status(200).json({ text: respuesta });
   } catch (error) {
-    console.error('❌ Error:', error);
+    console.error('❌ Error completo:', error.message);
+    console.error('❌ Stack:', error.stack);
     return res.status(200).json({ text: `❌ Error: ${error.message}` });
   }
 });
