@@ -175,39 +175,65 @@ async function enviarMensajeTelegram(chatId, texto) {
   }
 }
 
-// ─── Telegram: descargar y transcribir audio ──────────────────────────────────
+// ─── Telegram: descargar y transcribir audio con Google Speech-to-Text ────────
 async function transcribirAudioTelegram(fileId) {
   try {
-    // 1. Obtener URL del archivo
+    // 1. Obtener URL del archivo de Telegram
     const fileRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${fileId}`);
     const fileData = await fileRes.json();
-    if (!fileData.ok) throw new Error('No se pudo obtener el archivo');
+    if (!fileData.ok) throw new Error('No se pudo obtener el archivo de Telegram');
 
     const filePath = fileData.result.file_path;
     const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`;
 
     // 2. Descargar el audio
     const audioRes = await fetch(fileUrl);
-    const audioBuffer = await audioRes.arrayBuffer();
-    const audioBlob = new Blob([audioBuffer], { type: 'audio/ogg' });
+    const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
+    const audioBase64 = audioBuffer.toString('base64');
 
-    // 3. Transcribir con Whisper (OpenAI)
-    const formData = new FormData();
-    formData.append('file', audioBlob, 'audio.ogg');
-    formData.append('model', 'whisper-1');
-    formData.append('language', 'es');
+    // 3. Transcribir con Google Speech-to-Text
+    const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}');
+    if (credentials.private_key) {
+      credentials.private_key = credentials.private_key.replace(/\\n/g, '\n');
+    }
 
-    const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    const auth = new google.auth.JWT(
+      credentials.client_email,
+      null,
+      credentials.private_key,
+      ['https://www.googleapis.com/auth/cloud-platform']
+    );
+
+    const token = await auth.getAccessToken();
+
+    const speechRes = await fetch('https://speech.googleapis.com/v1/speech:recognize', {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
-      body: formData
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token.token}`
+      },
+      body: JSON.stringify({
+        config: {
+          encoding: 'OGG_OPUS',
+          sampleRateHertz: 48000,
+          languageCode: 'es-AR',
+          model: 'latest_long',
+          enableAutomaticPunctuation: true
+        },
+        audio: {
+          content: audioBase64
+        }
+      })
     });
 
-    const whisperData = await whisperRes.json();
-    return whisperData.text || null;
+    const speechData = await speechRes.json();
+    console.log('🎙️ Google Speech response:', JSON.stringify(speechData));
+
+    const transcript = speechData.results?.[0]?.alternatives?.[0]?.transcript;
+    return transcript || null;
 
   } catch (error) {
-    console.error('❌ Error transcripción:', error.message);
+    console.error('❌ Error transcripción Google Speech:', error.message);
     return null;
   }
 }
@@ -232,25 +258,26 @@ app.post('/webhook/telegram', async (req, res) => {
     if (message.text) {
       userText = message.text.trim();
     }
-    // Audio / mensaje de voz — intentar transcripción nativa de Telegram primero
+    // Audio / mensaje de voz
     else if (message.voice || message.audio) {
-      // Telegram a veces incluye transcripción automática
+      // Intentar transcripción nativa de Telegram primero
       if (message.voice?.transcription) {
         userText = message.voice.transcription;
         console.log('📝 Transcripción nativa Telegram:', userText);
       } else {
-        // Sino usar Whisper
+        // Usar Google Speech-to-Text
         const fileId = message.voice?.file_id || message.audio?.file_id;
-        if (process.env.OPENAI_API_KEY && fileId) {
-          await enviarMensajeTelegram(chatId, '🎙️ _Transcribiendo audio..._');
+        if (fileId) {
+          await enviarMensajeTelegram(chatId, '🎙️ _Transcribiendo..._');
           userText = await transcribirAudioTelegram(fileId);
           if (!userText) {
             await enviarMensajeTelegram(chatId, '❌ No pude transcribir el audio. Intentá escribir el mensaje.');
             return;
           }
-          console.log('📝 Transcripción Whisper:', userText);
+          console.log('📝 Transcripción Google Speech:', userText);
+          await enviarMensajeTelegram(chatId, `📝 _"${userText}"_`);
         } else {
-          await enviarMensajeTelegram(chatId, '🎙️ Audio recibido. Para transcripción automática, configurá OPENAI_API_KEY. Por ahora escribí el mensaje.');
+          await enviarMensajeTelegram(chatId, '❌ No pude obtener el audio.');
           return;
         }
       }
