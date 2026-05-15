@@ -152,54 +152,120 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'running', version: '3.0.0' });
 });
 
-// ─── Enviar mensaje via Chat REST API (asíncrono) ────────────────────────────
-async function enviarMensajeChatAPI(spaceName, texto) {
+// ─── Telegram: enviar mensaje ─────────────────────────────────────────────────
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+async function enviarMensajeTelegram(chatId, texto) {
   try {
-    const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}');
-    if (!credentials.client_email) {
-      console.error('⚠️ No hay service account configurado');
-      return;
-    }
-    if (credentials.private_key) {
-      credentials.private_key = credentials.private_key.replace(/\\n/g, '\n');
-    }
-
-    const auth = new google.auth.JWT(
-      credentials.client_email,
-      null,
-      credentials.private_key,
-      ['https://www.googleapis.com/auth/chat.bot']
-    );
-
-    const chat = google.chat({ version: 'v1', auth });
-    await chat.spaces.messages.create({
-      parent: spaceName,
-      requestBody: { text: texto }
+    const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: texto,
+        parse_mode: 'Markdown'
+      })
     });
-    console.log('✅ Mensaje enviado via Chat API a:', spaceName);
+    const data = await response.json();
+    if (!data.ok) console.error('❌ Telegram error:', data.description);
+    else console.log('✅ Mensaje enviado a Telegram:', chatId);
   } catch (error) {
-    console.error('❌ Error enviando mensaje Chat API:', error.message);
+    console.error('❌ Error Telegram:', error.message);
   }
 }
 
-// ─── Webhook ──────────────────────────────────────────────────────────────────
-app.post('/webhook/google-chat', async (req, res) => {
+// ─── Telegram: descargar y transcribir audio ──────────────────────────────────
+async function transcribirAudioTelegram(fileId) {
   try {
-    const body = req.body;
-    const message = body.message || body.chat?.messagePayload?.message;
-    if (!message) return res.status(200).send('');
-    if (message.sender?.type === 'BOT') return res.status(200).send('');
+    // 1. Obtener URL del archivo
+    const fileRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${fileId}`);
+    const fileData = await fileRes.json();
+    if (!fileData.ok) throw new Error('No se pudo obtener el archivo');
 
-    const userText = message.text?.trim() || message.argumentText?.trim();
-    if (!userText) return res.status(200).send('');
+    const filePath = fileData.result.file_path;
+    const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`;
 
-    const spaceName = message.space?.name;
-    console.log('💬 Lucas:', userText, '| Space:', spaceName);
+    // 2. Descargar el audio
+    const audioRes = await fetch(fileUrl);
+    const audioBuffer = await audioRes.arrayBuffer();
+    const audioBlob = new Blob([audioBuffer], { type: 'audio/ogg' });
 
-    // Responder inmediatamente para no hacer timeout
-    res.status(200).send('');
+    // 3. Transcribir con Whisper (OpenAI)
+    const formData = new FormData();
+    formData.append('file', audioBlob, 'audio.ogg');
+    formData.append('model', 'whisper-1');
+    formData.append('language', 'es');
 
-    // Procesar en background y enviar via Chat API
+    const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
+      body: formData
+    });
+
+    const whisperData = await whisperRes.json();
+    return whisperData.text || null;
+
+  } catch (error) {
+    console.error('❌ Error transcripción:', error.message);
+    return null;
+  }
+}
+
+// ─── Webhook Telegram ─────────────────────────────────────────────────────────
+app.post('/webhook/telegram', async (req, res) => {
+  res.status(200).send(''); // Responder inmediatamente
+
+  try {
+    const update = req.body;
+    const message = update.message || update.edited_message;
+    if (!message) return;
+
+    const chatId = message.chat.id;
+    const userId = message.from.id;
+
+    console.log('💬 Telegram update:', JSON.stringify(message, null, 2));
+
+    let userText = null;
+
+    // Texto normal
+    if (message.text) {
+      userText = message.text.trim();
+    }
+    // Audio / mensaje de voz — intentar transcripción nativa de Telegram primero
+    else if (message.voice || message.audio) {
+      // Telegram a veces incluye transcripción automática
+      if (message.voice?.transcription) {
+        userText = message.voice.transcription;
+        console.log('📝 Transcripción nativa Telegram:', userText);
+      } else {
+        // Sino usar Whisper
+        const fileId = message.voice?.file_id || message.audio?.file_id;
+        if (process.env.OPENAI_API_KEY && fileId) {
+          await enviarMensajeTelegram(chatId, '🎙️ _Transcribiendo audio..._');
+          userText = await transcribirAudioTelegram(fileId);
+          if (!userText) {
+            await enviarMensajeTelegram(chatId, '❌ No pude transcribir el audio. Intentá escribir el mensaje.');
+            return;
+          }
+          console.log('📝 Transcripción Whisper:', userText);
+        } else {
+          await enviarMensajeTelegram(chatId, '🎙️ Audio recibido. Para transcripción automática, configurá OPENAI_API_KEY. Por ahora escribí el mensaje.');
+          return;
+        }
+      }
+    }
+    // Otros tipos (fotos, documentos, etc.)
+    else {
+      await enviarMensajeTelegram(chatId, '⚠️ Solo proceso texto y audio. Mandame un mensaje de voz o escribí.');
+      return;
+    }
+
+    if (!userText) return;
+
+    console.log('💬 Lucas:', userText);
+
+    // Procesar y responder
     procesarIntencion(userText)
       .then(resultado => {
         console.log('🎯 Intención:', resultado.intencion);
@@ -207,17 +273,21 @@ app.post('/webhook/google-chat', async (req, res) => {
       })
       .then(respuesta => {
         console.log('📤 Enviando respuesta, largo:', respuesta?.length);
-        return enviarMensajeChatAPI(spaceName, respuesta);
+        return enviarMensajeTelegram(chatId, respuesta);
       })
-      .catch(error => {
-        console.error('❌ Error en procesamiento:', error.message);
-        if (spaceName) enviarMensajeChatAPI(spaceName, `❌ Error: ${error.message}`);
+      .catch(async error => {
+        console.error('❌ Error procesamiento:', error.message);
+        await enviarMensajeTelegram(chatId, `❌ Error: ${error.message}`);
       });
 
   } catch (error) {
-    console.error('❌ Error en webhook:', error.message);
-    res.status(200).send('');
+    console.error('❌ Error webhook Telegram:', error.message);
   }
+});
+
+// ─── Mantener webhook de Google Chat (por si acaso) ───────────────────────────
+app.post('/webhook/google-chat', async (req, res) => {
+  res.status(200).send('');
 });
 
 // ─── Procesar intención ───────────────────────────────────────────────────────
@@ -706,7 +776,8 @@ function mapTarea(page) {
 // ─── Iniciar servidor ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Segundo Cerebro Bot v3.0 en puerto ${PORT}`);
+  console.log(`🚀 Segundo Cerebro Bot v4.0 en puerto ${PORT}`);
   console.log(`📋 Notion: ${NOTION_DB_ID}`);
   console.log(`📅 Calendar: ${CALENDAR_ID}`);
+  console.log(`📱 Telegram: ${TELEGRAM_TOKEN ? '✅ configurado' : '❌ falta token'}`);
 });
