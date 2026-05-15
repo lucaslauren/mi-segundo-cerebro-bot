@@ -152,30 +152,71 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'running', version: '3.0.0' });
 });
 
+// ─── Enviar mensaje via Chat REST API (asíncrono) ────────────────────────────
+async function enviarMensajeChatAPI(spaceName, texto) {
+  try {
+    const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}');
+    if (!credentials.client_email) {
+      console.error('⚠️ No hay service account configurado');
+      return;
+    }
+    if (credentials.private_key) {
+      credentials.private_key = credentials.private_key.replace(/\\n/g, '\n');
+    }
+
+    const auth = new google.auth.JWT(
+      credentials.client_email,
+      null,
+      credentials.private_key,
+      ['https://www.googleapis.com/auth/chat.bot']
+    );
+
+    const chat = google.chat({ version: 'v1', auth });
+    await chat.spaces.messages.create({
+      parent: spaceName,
+      requestBody: { text: texto }
+    });
+    console.log('✅ Mensaje enviado via Chat API a:', spaceName);
+  } catch (error) {
+    console.error('❌ Error enviando mensaje Chat API:', error.message);
+  }
+}
+
 // ─── Webhook ──────────────────────────────────────────────────────────────────
 app.post('/webhook/google-chat', async (req, res) => {
   try {
     const body = req.body;
     const message = body.message || body.chat?.messagePayload?.message;
-    if (!message) return res.status(200).json({ text: '⚠️ Mensaje no reconocido.' });
-    if (message.sender?.type === 'BOT') return res.status(200).json({ ok: true });
+    if (!message) return res.status(200).send('');
+    if (message.sender?.type === 'BOT') return res.status(200).send('');
 
     const userText = message.text?.trim() || message.argumentText?.trim();
-    if (!userText) return res.status(200).json({ ok: true });
+    if (!userText) return res.status(200).send('');
 
-    console.log('💬 Lucas:', userText);
+    const spaceName = message.space?.name;
+    console.log('💬 Lucas:', userText, '| Space:', spaceName);
 
-    const resultado = await procesarIntencion(userText);
-    console.log('🎯 Intención detectada:', resultado.intencion);
+    // Responder inmediatamente para no hacer timeout
+    res.status(200).send('');
 
-    const respuesta = await ejecutarIntencion(resultado);
-    console.log('📤 Respuesta lista, largo:', respuesta?.length);
+    // Procesar en background y enviar via Chat API
+    procesarIntencion(userText)
+      .then(resultado => {
+        console.log('🎯 Intención:', resultado.intencion);
+        return ejecutarIntencion(resultado);
+      })
+      .then(respuesta => {
+        console.log('📤 Enviando respuesta, largo:', respuesta?.length);
+        return enviarMensajeChatAPI(spaceName, respuesta);
+      })
+      .catch(error => {
+        console.error('❌ Error en procesamiento:', error.message);
+        if (spaceName) enviarMensajeChatAPI(spaceName, `❌ Error: ${error.message}`);
+      });
 
-    return res.status(200).json({ text: respuesta });
   } catch (error) {
-    console.error('❌ Error completo:', error.message);
-    console.error('❌ Stack:', error.stack);
-    return res.status(200).json({ text: `❌ Error: ${error.message}` });
+    console.error('❌ Error en webhook:', error.message);
+    res.status(200).send('');
   }
 });
 
