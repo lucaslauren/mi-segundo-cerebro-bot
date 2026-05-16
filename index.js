@@ -330,7 +330,7 @@ async function procesarIntencionConMemoria(chatId, texto) {
   });
 
   const response = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
+    model: 'claude-sonnet-4-6',
     max_tokens: 2000,
     system: buildSystemPrompt(),
     messages: mensajes
@@ -347,7 +347,7 @@ async function procesarIntencionConMemoria(chatId, texto) {
 // ─── Procesar intención (sin memoria, para compatibilidad) ────────────────────
 async function procesarIntencion(texto) {
   const response = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
+    model: 'claude-sonnet-4-6',
     max_tokens: 2000,
     system: buildSystemPrompt(),
     messages: [{ role: 'user', content: `Mensaje de Lucas: "${texto}"` }]
@@ -679,7 +679,7 @@ async function ejecutarPlanDia() {
   else ctx += '- Sin tareas específicas para hoy\n';
 
   const resp = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
+    model: 'claude-sonnet-4-6',
     max_tokens: 800,
     messages: [{ role: 'user', content: `Sos el secretario de Lucas. Armá un briefing del día conciso. Empezá con la ROCA si hay. Máximo 200 palabras con emojis.\n\n${ctx}` }]
   });
@@ -708,7 +708,7 @@ async function ejecutarPlanSemana() {
   });
 
   const resp = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
+    model: 'claude-sonnet-4-6',
     max_tokens: 1000,
     messages: [{ role: 'user', content: `Sos el secretario de Lucas. Armá un plan semanal: 3 metas, ROCA del lunes, tareas por día. Máximo 350 palabras.\n\n${ctx}` }]
   });
