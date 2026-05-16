@@ -136,8 +136,8 @@ Determiná la intención y devolvé JSON válido sin texto extra ni markdown.
 CREAR_TAREA:
 {"intencion":"CREAR_TAREA","tareas":[{"siguiente_accion":"verbo+objeto","contexto":"exacto de la lista","proyecto":"nombre exacto o null","en_espera":"Nombre re: tema o null","dia_accion":"YYYY-MM-DD o null","fecha_limite":"YYYY-MM-DD o null","me_gustaria_hoy":false,"dos_minutos":false}],"respuesta":"confirmación"}
 
-MARCAR_HECHA:
-{"intencion":"MARCAR_HECHA","busqueda":"palabras clave de la tarea","respuesta":"confirmación"}
+MARCAR_HECHA (una o múltiples tareas):
+{"intencion":"MARCAR_HECHA","tareas":[{"busqueda":"palabras clave de la tarea"}],"respuesta":"confirmación"}
 
 CONSULTAR_TAREAS:
 {"intencion":"CONSULTAR_TAREAS","filtro":"hoy|mañana|semana|proyecto|todas|en_espera","proyecto":"nombre o null","respuesta":"placeholder"}
@@ -463,17 +463,43 @@ async function ejecutarCrearTarea(resultado) {
 
 // ─── MARCAR HECHA ─────────────────────────────────────────────────────────────
 async function ejecutarMarcarHecha(resultado) {
-  const tareas = await buscarTareasPorTexto(resultado.busqueda);
-  if (!tareas.length) return `❌ No encontré tarea con "${resultado.busqueda}". ¿Podés ser más específico?`;
+  // Soporta tanto formato viejo (busqueda string) como nuevo (tareas array)
+  const listaBusquedas = resultado.tareas
+    ? resultado.tareas.map(t => t.busqueda)
+    : [resultado.busqueda];
 
-  const tarea = tareas[0];
-  await notion.pages.update({
-    page_id: tarea.id,
-    properties: { 'Hecho': { checkbox: true } }
-  });
+  if (!listaBusquedas.length || !listaBusquedas[0]) {
+    return '❌ No pude identificar qué tarea marcar como hecha.';
+  }
 
-  console.log('✅ Marcada hecha:', tarea.titulo);
-  return `✅ Listo — *"${tarea.titulo}"* marcada como hecha.`;
+  const marcadas = [];
+  const noEncontradas = [];
+
+  for (const busqueda of listaBusquedas) {
+    const tareas = await buscarTareasPorTexto(busqueda);
+    if (!tareas.length) {
+      noEncontradas.push(busqueda);
+      continue;
+    }
+    const tarea = tareas[0];
+    await notion.pages.update({
+      page_id: tarea.id,
+      properties: { 'Hecho': { checkbox: true } }
+    });
+    marcadas.push(tarea.titulo);
+    console.log('✅ Marcada hecha:', tarea.titulo);
+  }
+
+  let msg = '';
+  if (marcadas.length > 0) {
+    msg += `✅ *${marcadas.length === 1 ? 'Listo' : `${marcadas.length} tareas marcadas`}*\n`;
+    marcadas.forEach(t => { msg += `• "${t}"\n`; });
+  }
+  if (noEncontradas.length > 0) {
+    msg += `\n⚠️ No encontré: ${noEncontradas.join(', ')}`;
+  }
+
+  return msg.trim();
 }
 
 // ─── CONSULTAR TAREAS ─────────────────────────────────────────────────────────
