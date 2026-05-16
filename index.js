@@ -734,9 +734,31 @@ async function guardarEnNotion(tarea) {
 
 // ─── BUSCAR TAREAS POR TEXTO ──────────────────────────────────────────────────
 async function buscarTareasPorTexto(busqueda) {
-  // Intentar búsqueda con cada palabra significativa hasta encontrar resultados
-  const palabras = busqueda.split(' ').filter(p => p.length > 3);
+  // Priorizar nombres propios y palabras clave específicas
+  // Palabras a ignorar en la búsqueda
+  const stopWords = ['hablar', 'llamar', 'reunir', 'contactar', 'habla', 'llama', 'con', 'por', 'para', 'sobre', 'acerca', 'already', 'hice', 'hable', 'llame'];
   
+  const palabras = busqueda.split(' ').filter(p => p.length > 2);
+  
+  // Primero intentar con palabras que NO son stop words (nombres propios, temas específicos)
+  const palabrasEspecificas = palabras.filter(p => !stopWords.includes(p.toLowerCase()));
+  
+  // Intentar con cada palabra específica
+  for (const palabra of palabrasEspecificas) {
+    const response = await notion.databases.query({
+      database_id: NOTION_DB_ID,
+      filter: {
+        and: [
+          { property: 'Hecho', checkbox: { equals: false } },
+          { property: 'Siguiente acción', title: { contains: palabra } }
+        ]
+      },
+      page_size: 10
+    });
+    if (response.results.length > 0) return response.results.map(mapTarea);
+  }
+
+  // Fallback con todas las palabras
   for (const palabra of palabras) {
     const response = await notion.databases.query({
       database_id: NOTION_DB_ID,
@@ -751,7 +773,7 @@ async function buscarTareasPorTexto(busqueda) {
     if (response.results.length > 0) return response.results.map(mapTarea);
   }
 
-  // Fallback: búsqueda con la frase completa
+  // Último fallback: frase completa
   const response = await notion.databases.query({
     database_id: NOTION_DB_ID,
     filter: {
