@@ -216,8 +216,7 @@ async function transcribirAudioTelegram(fileId) {
         config: {
           encoding: 'OGG_OPUS',
           sampleRateHertz: 48000,
-          languageCode: 'es-AR',
-          model: 'latest_long',
+          languageCode: 'es-419',
           enableAutomaticPunctuation: true
         },
         audio: {
