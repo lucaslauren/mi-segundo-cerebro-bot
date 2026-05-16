@@ -217,51 +217,35 @@ async function transcribirAudioTelegram(fileId) {
 
 // ─── Webhook Telegram ─────────────────────────────────────────────────────────
 app.post('/webhook/telegram', async (req, res) => {
-  res.status(200).send(''); // Responder inmediatamente
+  res.status(200).send('');
 
   try {
     const update = req.body;
+
+    // Manejar mensaje nuevo o mensaje editado (cuando Telegram agrega transcripción)
     const message = update.message || update.edited_message;
     if (!message) return;
 
     const chatId = message.chat.id;
-    const userId = message.from.id;
-
-    console.log('💬 Telegram update:', JSON.stringify(message, null, 2));
-
     let userText = null;
 
     // Texto normal
     if (message.text) {
       userText = message.text.trim();
     }
-    // Audio / mensaje de voz
-    else if (message.voice || message.audio) {
-      // Intentar transcripción nativa de Telegram primero
-      if (message.voice?.transcription) {
-        userText = message.voice.transcription;
-        console.log('📝 Transcripción nativa Telegram:', userText);
-      } else {
-        // Usar Google Speech-to-Text
-        const fileId = message.voice?.file_id || message.audio?.file_id;
-        if (fileId) {
-          await enviarMensajeTelegram(chatId, '🎙️ _Transcribiendo..._');
-          userText = await transcribirAudioTelegram(fileId);
-          if (!userText) {
-            await enviarMensajeTelegram(chatId, '❌ No pude transcribir el audio. Intentá escribir el mensaje.');
-            return;
-          }
-          console.log('📝 Transcripción Google Speech:', userText);
-          await enviarMensajeTelegram(chatId, `📝 _"${userText}"_`);
-        } else {
-          await enviarMensajeTelegram(chatId, '❌ No pude obtener el audio.');
-          return;
-        }
-      }
+    // Audio con transcripción manual (cuando el usuario toca →A en Telegram)
+    else if (message.voice?.transcription) {
+      userText = message.voice.transcription;
+      console.log('📝 Transcripción manual Telegram:', userText);
+      await enviarMensajeTelegram(chatId, `📝 _"${userText}"_`);
     }
-    // Otros tipos (fotos, documentos, etc.)
+    // Audio sin transcripción — ignorar silenciosamente
+    else if (message.voice || message.audio) {
+      console.log('🎙️ Audio sin transcripción — ignorando');
+      return;
+    }
+    // Otros tipos
     else {
-      await enviarMensajeTelegram(chatId, '⚠️ Solo proceso texto y audio. Mandame un mensaje de voz o escribí.');
       return;
     }
 
@@ -269,18 +253,17 @@ app.post('/webhook/telegram', async (req, res) => {
 
     console.log('💬 Lucas:', userText);
 
-    // Procesar y responder
     procesarIntencion(userText)
       .then(resultado => {
         console.log('🎯 Intención:', resultado.intencion);
         return ejecutarIntencion(resultado);
       })
       .then(respuesta => {
-        console.log('📤 Enviando respuesta, largo:', respuesta?.length);
+        console.log('📤 Enviando, largo:', respuesta?.length);
         return enviarMensajeTelegram(chatId, respuesta);
       })
       .catch(async error => {
-        console.error('❌ Error procesamiento:', error.message);
+        console.error('❌ Error:', error.message);
         await enviarMensajeTelegram(chatId, `❌ Error: ${error.message}`);
       });
 
