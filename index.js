@@ -175,7 +175,7 @@ async function enviarMensajeTelegram(chatId, texto) {
   }
 }
 
-// ─── Telegram: descargar y transcribir audio con Google Speech-to-Text ────────
+// ─── Telegram: transcribir audio con Groq Whisper ────────────────────────────
 async function transcribirAudioTelegram(fileId) {
   try {
     // 1. Obtener URL del archivo de Telegram
@@ -189,50 +189,28 @@ async function transcribirAudioTelegram(fileId) {
     // 2. Descargar el audio
     const audioRes = await fetch(fileUrl);
     const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
-    const audioBase64 = audioBuffer.toString('base64');
 
-    // 3. Transcribir con Google Speech-to-Text
-    const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}');
-    if (credentials.private_key) {
-      credentials.private_key = credentials.private_key.replace(/\\n/g, '\n');
-    }
+    // 3. Transcribir con Groq Whisper
+    const formData = new FormData();
+    const audioBlob = new Blob([audioBuffer], { type: 'audio/ogg' });
+    formData.append('file', audioBlob, 'audio.ogg');
+    formData.append('model', 'whisper-large-v3-turbo');
+    formData.append('language', 'es');
+    formData.append('response_format', 'json');
 
-    const auth = new google.auth.JWT(
-      credentials.client_email,
-      null,
-      credentials.private_key,
-      ['https://www.googleapis.com/auth/cloud-platform']
-    );
-
-    const token = await auth.getAccessToken();
-
-    const speechRes = await fetch('https://speech.googleapis.com/v1/speech:recognize', {
+    const groqRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token.token}`
-      },
-      body: JSON.stringify({
-        config: {
-          encoding: 'OGG_OPUS',
-          sampleRateHertz: 48000,
-          languageCode: 'es-419',
-          enableAutomaticPunctuation: true
-        },
-        audio: {
-          content: audioBase64
-        }
-      })
+      headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      body: formData
     });
 
-    const speechData = await speechRes.json();
-    console.log('🎙️ Google Speech response:', JSON.stringify(speechData));
+    const groqData = await groqRes.json();
+    console.log('🎙️ Groq response:', JSON.stringify(groqData));
 
-    const transcript = speechData.results?.[0]?.alternatives?.[0]?.transcript;
-    return transcript || null;
+    return groqData.text || null;
 
   } catch (error) {
-    console.error('❌ Error transcripción Google Speech:', error.message);
+    console.error('❌ Error transcripción Groq:', error.message);
     return null;
   }
 }
