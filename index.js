@@ -223,7 +223,8 @@ app.post('/webhook/telegram', async (req, res) => {
     const update = req.body;
 
     // Manejar mensaje nuevo o mensaje editado (cuando Telegram agrega transcripción)
-    const message = update.message || update.edited_message;
+    console.log('📦 Update completo:', JSON.stringify(update, null, 2));
+const message = update.message || update.edited_message;
     if (!message) return;
 
     const chatId = message.chat.id;
