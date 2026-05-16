@@ -27,6 +27,23 @@ const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 const NOTION_DB_ID = process.env.NOTION_DATABASE_ID;
 const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || 'lucas@dlaurenzano.com';
+const NOTION_HISTORIAL_ID = '3626046f0fee80188b21c9964d5610f7';
+
+// ─── Memoria de sesión (RAM) ──────────────────────────────────────────────────
+// Guarda los últimos mensajes por chatId para contexto conversacional
+const memoriaSession = new Map();
+const MAX_MENSAJES_SESSION = 15;
+
+function agregarAlHistorialSession(chatId, rol, contenido) {
+  if (!memoriaSession.has(chatId)) memoriaSession.set(chatId, []);
+  const historial = memoriaSession.get(chatId);
+  historial.push({ role: rol, content: contenido, timestamp: new Date().toISOString() });
+  if (historial.length > MAX_MENSAJES_SESSION) historial.shift();
+}
+
+function obtenerHistorialSession(chatId) {
+  return memoriaSession.get(chatId) || [];
+}
 
 // ─── Google Calendar (Service Account) ───────────────────────────────────────
 function getCalendarClient() {
@@ -221,10 +238,7 @@ app.post('/webhook/telegram', async (req, res) => {
 
   try {
     const update = req.body;
-
-    // Manejar mensaje nuevo o mensaje editado (cuando Telegram agrega transcripción)
-    console.log('📦 Update completo:', JSON.stringify(update, null, 2));
-const message = update.message || update.edited_message;
+    const message = update.message || update.edited_message;
     if (!message) return;
 
     const chatId = message.chat.id;
@@ -234,18 +248,22 @@ const message = update.message || update.edited_message;
     if (message.text) {
       userText = message.text.trim();
     }
-    // Audio con transcripción manual (cuando el usuario toca →A en Telegram)
-    else if (message.voice?.transcription) {
-      userText = message.voice.transcription;
-      console.log('📝 Transcripción manual Telegram:', userText);
-      await enviarMensajeTelegram(chatId, `📝 _"${userText}"_`);
-    }
-    // Audio sin transcripción — ignorar silenciosamente
+    // Audio — transcribir automáticamente con Groq
     else if (message.voice || message.audio) {
-      console.log('🎙️ Audio sin transcripción — ignorando');
-      return;
+      const fileId = message.voice?.file_id || message.audio?.file_id;
+      if (fileId) {
+        await enviarMensajeTelegram(chatId, '🎙️ _Transcribiendo..._');
+        userText = await transcribirAudioTelegram(fileId);
+        if (!userText) {
+          await enviarMensajeTelegram(chatId, '❌ No pude transcribir el audio. Intentá escribir el mensaje.');
+          return;
+        }
+        console.log('📝 Transcripción Groq:', userText);
+        await enviarMensajeTelegram(chatId, `📝 _"${userText}"_`);
+      } else {
+        return;
+      }
     }
-    // Otros tipos
     else {
       return;
     }
@@ -254,10 +272,18 @@ const message = update.message || update.edited_message;
 
     console.log('💬 Lucas:', userText);
 
-    procesarIntencion(userText)
-      .then(resultado => {
+    // Agregar al historial de sesión
+    agregarAlHistorialSession(chatId, 'user', userText);
+
+    procesarIntencionConMemoria(chatId, userText)
+      .then(async resultado => {
         console.log('🎯 Intención:', resultado.intencion);
-        return ejecutarIntencion(resultado);
+        const respuesta = await ejecutarIntencion(resultado);
+        // Guardar respuesta en historial de sesión
+        agregarAlHistorialSession(chatId, 'assistant', respuesta);
+        // Guardar en Notion si es relevante
+        await guardarEnHistorialNotion(userText, respuesta, resultado.intencion);
+        return respuesta;
       })
       .then(respuesta => {
         console.log('📤 Enviando, largo:', respuesta?.length);
@@ -278,7 +304,47 @@ app.post('/webhook/google-chat', async (req, res) => {
   res.status(200).send('');
 });
 
-// ─── Procesar intención ───────────────────────────────────────────────────────
+// ─── Procesar intención con memoria de sesión ─────────────────────────────────
+async function procesarIntencionConMemoria(chatId, texto) {
+  const historial = obtenerHistorialSession(chatId);
+
+  // Construir mensajes con historial de sesión
+  const mensajes = [];
+
+  // Agregar historial de sesión como contexto
+  if (historial.length > 1) {
+    // El último mensaje es el actual, los anteriores son contexto
+    const contextoAnterior = historial.slice(0, -1);
+    for (const msg of contextoAnterior) {
+      mensajes.push({
+        role: msg.role,
+        content: msg.content
+      });
+    }
+  }
+
+  // Agregar mensaje actual
+  mensajes.push({
+    role: 'user',
+    content: `Mensaje de Lucas: "${texto}"`
+  });
+
+  const response = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 2000,
+    system: buildSystemPrompt(),
+    messages: mensajes
+  });
+
+  const raw = response.content[0].text.trim();
+  console.log('🤖 Claude:', raw);
+
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error('Claude no devolvió JSON válido');
+  return JSON.parse(jsonMatch[0]);
+}
+
+// ─── Procesar intención (sin memoria, para compatibilidad) ────────────────────
 async function procesarIntencion(texto) {
   const response = await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001',
@@ -290,10 +356,61 @@ async function procesarIntencion(texto) {
   const raw = response.content[0].text.trim();
   console.log('🤖 Claude:', raw);
 
-  // Extraer solo el bloque JSON aunque venga con texto alrededor
   const jsonMatch = raw.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new Error('Claude no devolvió JSON válido');
   return JSON.parse(jsonMatch[0]);
+}
+
+// ─── Guardar en historial de Notion ──────────────────────────────────────────
+async function guardarEnHistorialNotion(userText, respuesta, intencion) {
+  try {
+    // Solo guardar acciones importantes, no consultas simples
+    const accionesImportantes = ['CREAR_TAREA', 'MARCAR_HECHA', 'EDITAR_TAREA', 'CREAR_EVENTO', 'MODIFICAR_EVENTO'];
+    if (!accionesImportantes.includes(intencion)) return;
+
+    const fecha = new Date().toLocaleDateString('es-AR', {
+      timeZone: 'America/Argentina/Buenos_Aires',
+      day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit'
+    });
+
+    const emoji = {
+      CREAR_TAREA: '📌',
+      MARCAR_HECHA: '✅',
+      EDITAR_TAREA: '✏️',
+      CREAR_EVENTO: '📅',
+      MODIFICAR_EVENTO: '📅'
+    }[intencion] || '📝';
+
+    // Agregar un bloque de texto a la página de historial
+    await notion.blocks.children.append({
+      block_id: NOTION_HISTORIAL_ID,
+      children: [
+        {
+          object: 'block',
+          type: 'paragraph',
+          paragraph: {
+            rich_text: [
+              {
+                type: 'text',
+                text: { content: `${emoji} [${fecha}] ` },
+                annotations: { bold: true }
+              },
+              {
+                type: 'text',
+                text: { content: `${userText} → ${respuesta.substring(0, 200)}` }
+              }
+            ]
+          }
+        }
+      ]
+    });
+
+    console.log('📚 Guardado en historial Notion');
+  } catch (error) {
+    console.error('⚠️ Error guardando historial Notion:', error.message);
+    // No fallar si no se puede guardar el historial
+  }
 }
 
 // ─── Ejecutar intención ───────────────────────────────────────────────────────
@@ -764,8 +881,9 @@ function mapTarea(page) {
 // ─── Iniciar servidor ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Segundo Cerebro Bot v4.0 en puerto ${PORT}`);
+  console.log(`🚀 Segundo Cerebro Bot v5.0 en puerto ${PORT}`);
   console.log(`📋 Notion: ${NOTION_DB_ID}`);
   console.log(`📅 Calendar: ${CALENDAR_ID}`);
+  console.log(`📚 Historial: ${NOTION_HISTORIAL_ID}`);
   console.log(`📱 Telegram: ${TELEGRAM_TOKEN ? '✅ configurado' : '❌ falta token'}`);
 });
