@@ -122,7 +122,11 @@ REGLAS IMPORTANTES:
 4. Si no encontrás la tarea exacta, buscá la más similar semánticamente
 5. Podés ejecutar múltiples herramientas en un solo mensaje
 6. Respondé siempre en español argentino, de manera directa y útil
-7. Cuando uses herramientas, esperá el resultado antes de responder`;
+7. Cuando uses herramientas, esperá el resultado antes de responder
+8. CONTEXTOS CON T (ej: T Ordenador, T ROCA, T < 5 min) = TRABAJO. Sin T = PERSONAL.
+   Cuando Lucas pregunta por tareas "del trabajo" → filtro "trabajo"
+   Cuando pregunta por tareas "personales" → filtro "personal"
+   Cuando pregunta en general → filtro "todas"`;
 }
 
 // ─── Definición de herramientas ───────────────────────────────────────────────
@@ -167,8 +171,8 @@ const TOOLS = [
       properties: {
         filtro: {
           type: 'string',
-          enum: ['hoy', 'mañana', 'semana', 'todas', 'en_espera', 'proyecto'],
-          description: 'Qué tareas traer'
+          enum: ['hoy', 'mañana', 'semana', 'todas', 'en_espera', 'proyecto', 'trabajo', 'personal'],
+          description: 'Qué tareas traer. "trabajo" = solo contextos con T. "personal" = solo contextos sin T'
         },
         proyecto: { type: 'string', description: 'Nombre del proyecto si filtro es "proyecto"' }
       },
@@ -388,37 +392,60 @@ async function tool_consultar_tareas(input) {
         }
       });
       tareas = resp.results.map(mapTarea);
-    } else {
-      // todas
+    } else if (input.filtro === 'trabajo') {
+      const contextosT = ['T ROCA', 'T Ordenador', 'T < 5 min', 'T algún día/ a lo mejor', 'T Leer/ Revisar', 'T Tarea manual oficina', 'T Tarea fuera oficina'];
       const resp = await notion.databases.query({
         database_id: NOTION_DB_ID,
         filter: {
           and: [
             { property: 'Hecho', checkbox: { equals: false } },
-            {
-              or: [
-                { property: 'Contexto', select: { is_empty: true } },
-                { property: 'Contexto', select: { equals: 'ROCA' } },
-                { property: 'Contexto', select: { equals: 'T ROCA' } },
-                { property: 'Contexto', select: { equals: 'Ordenador' } },
-                { property: 'Contexto', select: { equals: 'T Ordenador' } },
-                { property: 'Contexto', select: { equals: '< 5 min' } },
-                { property: 'Contexto', select: { equals: 'T < 5 min' } },
-                { property: 'Contexto', select: { equals: 'Tarea manual casa' } },
-                { property: 'Contexto', select: { equals: 'Energía baja' } },
-                { property: 'Contexto', select: { equals: 'Tarea fuera de casa' } },
-                { property: 'Contexto', select: { equals: 'Leer/Revisar' } },
-                { property: 'Contexto', select: { equals: 'T Leer/ Revisar' } },
-                { property: 'Contexto', select: { equals: 'T Tarea manual oficina' } },
-                { property: 'Contexto', select: { equals: 'T Tarea fuera oficina' } }
-              ]
-            }
+            { or: contextosT.map(c => ({ property: 'Contexto', select: { equals: c } })) }
           ]
         },
         sorts: [{ property: 'Dia acción', direction: 'ascending' }],
         page_size: 50
       });
       tareas = resp.results.map(mapTarea);
+    } else if (input.filtro === 'personal') {
+      const contextosPersonales = ['ROCA', 'Ordenador', '< 5 min', 'algún día/ a lo mejor', 'Tarea manual casa', 'Energía baja', 'Tarea fuera de casa', 'Leer/Revisar'];
+      const resp = await notion.databases.query({
+        database_id: NOTION_DB_ID,
+        filter: {
+          and: [
+            { property: 'Hecho', checkbox: { equals: false } },
+            { or: [
+              { property: 'Contexto', select: { is_empty: true } },
+              ...contextosPersonales.map(c => ({ property: 'Contexto', select: { equals: c } }))
+            ]}
+          ]
+        },
+        sorts: [{ property: 'Dia acción', direction: 'ascending' }],
+        page_size: 50
+      });
+      tareas = resp.results.map(mapTarea);
+    } else {
+      // todas — contextos personales y de trabajo
+      const todosContextos = [
+        'ROCA', 'T ROCA', 'Ordenador', 'T Ordenador', '< 5 min', 'T < 5 min',
+        'Tarea manual casa', 'Energía baja', 'algún día/ a lo mejor', 'T algún día/ a lo mejor',
+        'Tarea fuera de casa', 'Leer/Revisar', 'T Leer/ Revisar',
+        'T Tarea manual oficina', 'T Tarea fuera oficina'
+      ];
+      const resp2 = await notion.databases.query({
+        database_id: NOTION_DB_ID,
+        filter: {
+          and: [
+            { property: 'Hecho', checkbox: { equals: false } },
+            { or: [
+              { property: 'Contexto', select: { is_empty: true } },
+              ...todosContextos.map(c => ({ property: 'Contexto', select: { equals: c } }))
+            ]}
+          ]
+        },
+        sorts: [{ property: 'Dia acción', direction: 'ascending' }],
+        page_size: 50
+      });
+      tareas = resp2.results.map(mapTarea);
     }
 
     return { filtro: input.filtro, cantidad: tareas.length, tareas };
