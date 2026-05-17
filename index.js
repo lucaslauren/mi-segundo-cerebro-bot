@@ -264,6 +264,28 @@ const TOOLS = [
     }
   },
   {
+    name: 'eliminar_evento_calendario',
+    description: 'Elimina un evento del calendario de Lucas buscándolo por título',
+    input_schema: {
+      type: 'object',
+      properties: {
+        titulo: { type: 'string', description: 'Título o palabras clave del evento a eliminar' }
+      },
+      required: ['titulo']
+    }
+  },
+  {
+    name: 'eliminar_tarea_notion',
+    description: 'Elimina (archiva) una tarea de Notion. Usar cuando Lucas pide borrar una tarea, no solo marcarla como hecha.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        busqueda: { type: 'string', description: 'Palabras clave de la tarea a eliminar' }
+      },
+      required: ['busqueda']
+    }
+  },
+  {
     name: 'buscar_en_drive',
     description: 'Busca archivos en Google Drive de Lucas y devuelve los links',
     input_schema: {
@@ -648,6 +670,68 @@ async function tool_plan_del_dia() {
   }
 }
 
+async function tool_eliminar_evento_calendario(input) {
+  try {
+    const auth = getGoogleAuth();
+    if (!auth) return { ok: false, error: 'Calendar no configurado' };
+    const cal = google.calendar({ version: 'v3', auth });
+
+    const ahora = new Date();
+    const en30 = new Date(ahora.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const resp = await cal.events.list({
+      calendarId: CALENDAR_ID,
+      timeMin: ahora.toISOString(),
+      timeMax: en30.toISOString(),
+      q: input.titulo,
+      singleEvents: true,
+      maxResults: 5
+    });
+
+    const eventos = resp.data.items || [];
+    if (eventos.length === 0) return { ok: false, error: `No encontré evento con "${input.titulo}"` };
+
+    const evento = eventos[0];
+    await cal.events.delete({ calendarId: CALENDAR_ID, eventId: evento.id });
+    await guardarHistorial(`Eliminó evento: "${evento.summary}"`, null);
+    console.log('✅ Evento eliminado:', evento.summary);
+    return { ok: true, titulo: evento.summary, fecha: evento.start.date || evento.start.dateTime?.split('T')[0] };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+async function tool_eliminar_tarea_notion(input) {
+  try {
+    const stopWords = ['tarea', 'hacer', 'con', 'por', 'para', 'sobre', 'borrar', 'eliminar'];
+    const palabras = input.busqueda.split(' ').filter(p => p.length > 2 && !stopWords.includes(p.toLowerCase()));
+
+    let tareaEncontrada = null;
+    for (const palabra of palabras) {
+      const resp = await notion.databases.query({
+        database_id: NOTION_DB_ID,
+        filter: {
+          and: [
+            { property: 'Hecho', checkbox: { equals: false } },
+            { property: 'Siguiente acción', title: { contains: palabra } }
+          ]
+        },
+        page_size: 5
+      });
+      if (resp.results.length > 0) { tareaEncontrada = resp.results[0]; break; }
+    }
+
+    if (!tareaEncontrada) return { ok: false, error: `No encontré tarea con "${input.busqueda}"` };
+
+    const titulo = tareaEncontrada.properties['Siguiente acción']?.title?.[0]?.text?.content || '';
+    await notion.pages.update({ page_id: tareaEncontrada.id, archived: true });
+    await guardarHistorial(`Eliminó tarea: "${titulo}"`, null);
+    console.log('✅ Tarea eliminada:', titulo);
+    return { ok: true, titulo };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
 // ─── Ejecutar herramienta ─────────────────────────────────────────────────────
 async function ejecutarHerramienta(nombre, input) {
   console.log(`🔧 Ejecutando: ${nombre}`, JSON.stringify(input).substring(0, 100));
@@ -658,6 +742,8 @@ async function ejecutarHerramienta(nombre, input) {
     case 'editar_tarea':              return await tool_editar_tarea(input);
     case 'crear_evento_calendario':   return await tool_crear_evento_calendario(input);
     case 'consultar_calendario':      return await tool_consultar_calendario(input);
+    case 'eliminar_evento_calendario': return await tool_eliminar_evento_calendario(input);
+    case 'eliminar_tarea_notion':     return await tool_eliminar_tarea_notion(input);
     case 'buscar_en_drive':           return await tool_buscar_en_drive(input);
     case 'plan_del_dia':              return await tool_plan_del_dia();
     default: return { error: `Herramienta desconocida: ${nombre}` };
