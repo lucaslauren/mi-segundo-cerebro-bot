@@ -79,6 +79,25 @@ function sumarHora(h, n) {
   return d.toTimeString().substring(0, 5);
 }
 
+// Argentina es siempre UTC-3, sin DST
+function getBuenosAiresDateRange(periodo) {
+  const TZ = 'America/Argentina/Buenos_Aires';
+  const OFFSET = '-03:00';
+  const hoyStr = new Date().toLocaleDateString('en-CA', { timeZone: TZ });
+  const [y, m, d] = hoyStr.split('-').map(Number);
+
+  if (periodo === 'hoy') {
+    return { timeMin: `${hoyStr}T00:00:00${OFFSET}`, timeMax: `${hoyStr}T23:59:59${OFFSET}` };
+  }
+  if (periodo === 'mañana') {
+    const manStr = new Date(Date.UTC(y, m - 1, d + 1)).toLocaleDateString('en-CA', { timeZone: TZ });
+    return { timeMin: `${manStr}T00:00:00${OFFSET}`, timeMax: `${manStr}T23:59:59${OFFSET}` };
+  }
+  // semana
+  const en7Str = new Date(Date.UTC(y, m - 1, d + 7)).toLocaleDateString('en-CA', { timeZone: TZ });
+  return { timeMin: `${hoyStr}T00:00:00${OFFSET}`, timeMax: `${en7Str}T23:59:59${OFFSET}` };
+}
+
 function mapTarea(page) {
   return {
     id: page.id,
@@ -542,30 +561,24 @@ async function tool_consultar_calendario(input) {
     if (!auth) return { ok: false, error: 'Calendar no configurado' };
     const cal = google.calendar({ version: 'v3', auth });
 
-    const ahora = new Date(); ahora.setHours(0, 0, 0, 0);
-    let timeMin = ahora.toISOString();
-    let timeMax;
-
-    if (input.periodo === 'hoy') {
-      const fin = new Date(ahora); fin.setHours(23, 59, 59);
-      timeMax = fin.toISOString();
-    } else if (input.periodo === 'mañana') {
-      const man = new Date(ahora); man.setDate(man.getDate() + 1);
-      timeMin = man.toISOString();
-      const finMan = new Date(man); finMan.setHours(23, 59, 59);
-      timeMax = finMan.toISOString();
-    } else {
-      const en7 = new Date(ahora); en7.setDate(en7.getDate() + 7);
-      timeMax = en7.toISOString();
-    }
+    const { timeMin, timeMax } = getBuenosAiresDateRange(input.periodo);
+    console.log(`📅 Calendar query: periodo=${input.periodo} | ${timeMin} → ${timeMax} | calendarId=${CALENDAR_ID}`);
 
     let eventos = [];
     try {
       const resp = await cal.events.list({ calendarId: CALENDAR_ID, timeMin, timeMax, singleEvents: true, orderBy: 'startTime', maxResults: 20 });
       eventos = resp.data.items || [];
+      console.log(`📅 Eventos (${CALENDAR_ID}): ${eventos.length}`);
     } catch (e) {
-      const resp = await cal.events.list({ calendarId: 'primary', timeMin, timeMax, singleEvents: true, orderBy: 'startTime', maxResults: 20 });
-      eventos = resp.data.items || [];
+      console.error(`⚠️ Calendar error con calendarId=${CALENDAR_ID}: ${e.message}`);
+      try {
+        const resp = await cal.events.list({ calendarId: 'primary', timeMin, timeMax, singleEvents: true, orderBy: 'startTime', maxResults: 20 });
+        eventos = resp.data.items || [];
+        console.log(`📅 Eventos (primary fallback): ${eventos.length}`);
+      } catch (e2) {
+        console.error(`⚠️ Calendar error con primary: ${e2.message}`);
+        throw e2;
+      }
     }
 
     return {
@@ -579,6 +592,7 @@ async function tool_consultar_calendario(input) {
       }))
     };
   } catch (e) {
+    console.error('❌ tool_consultar_calendario:', e.message);
     return { ok: false, error: e.message };
   }
 }
