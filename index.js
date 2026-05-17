@@ -515,11 +515,17 @@ async function tool_crear_evento_calendario(input) {
     }
 
     let resp;
+  try {
+    resp = await cal.events.insert({ calendarId: CALENDAR_ID, requestBody: eventBody });
+  } catch (e) {
+    console.error('❌ Calendar error con', CALENDAR_ID, ':', e.message);
     try {
-      resp = await cal.events.insert({ calendarId: CALENDAR_ID, requestBody: eventBody });
-    } catch (e) {
       resp = await cal.events.insert({ calendarId: 'primary', requestBody: eventBody });
+    } catch (e2) {
+      console.error('❌ Calendar error con primary:', e2.message);
+      return { ok: false, error: e2.message };
     }
+  }
 
     await guardarHistorial(`Agendó: "${input.titulo}" el ${input.fecha}`, null);
     return { ok: true, titulo: input.titulo, fecha: input.fecha, hora: input.hora_inicio, id: resp.data.id };
