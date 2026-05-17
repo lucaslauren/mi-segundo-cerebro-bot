@@ -48,7 +48,13 @@ function getGoogleAuth(scopes) {
     const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}');
     if (!creds.client_email) return null;
     if (creds.private_key) creds.private_key = creds.private_key.replace(/\\n/g, '\n');
-    return new google.auth.JWT(creds.client_email, null, creds.private_key, scopes);
+    return new google.auth.JWT(
+      creds.client_email,
+      null,
+      creds.private_key,
+      scopes,
+      'lucas@dlaurenzano.com'  // Impersonar a Lucas
+    );
   } catch (e) {
     console.error('⚠️ Google Auth error:', e.message);
     return null;
