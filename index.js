@@ -43,18 +43,15 @@ function obtenerHistorial(chatId) {
 }
 
 // ─── Google Auth ──────────────────────────────────────────────────────────────
-function getGoogleAuth(scopes) {
+function getGoogleAuth() {
   try {
-    const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}');
-    if (!creds.client_email) return null;
-    if (creds.private_key) creds.private_key = creds.private_key.replace(/\\n/g, '\n');
-    return new google.auth.JWT(
-      creds.client_email,
-      null,
-      creds.private_key,
-      scopes,
-      'lucas@dlaurenzano.com'  // Impersonar a Lucas
-    );
+    const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+    const refreshToken = process.env.GOOGLE_OAUTH_REFRESH_TOKEN;
+    if (!clientId || !clientSecret || !refreshToken) return null;
+    const auth = new google.auth.OAuth2(clientId, clientSecret);
+    auth.setCredentials({ refresh_token: refreshToken });
+    return auth;
   } catch (e) {
     console.error('⚠️ Google Auth error:', e.message);
     return null;
@@ -525,7 +522,7 @@ async function tool_editar_tarea(input) {
 
 async function tool_crear_evento_calendario(input) {
   try {
-    const auth = getGoogleAuth(['https://www.googleapis.com/auth/calendar']);
+    const auth = getGoogleAuth();
     if (!auth) return { ok: false, error: 'Calendar no configurado' };
     const cal = google.calendar({ version: 'v3', auth });
 
@@ -557,7 +554,7 @@ async function tool_crear_evento_calendario(input) {
 
 async function tool_consultar_calendario(input) {
   try {
-    const auth = getGoogleAuth(['https://www.googleapis.com/auth/calendar.readonly']);
+    const auth = getGoogleAuth();
     if (!auth) return { ok: false, error: 'Calendar no configurado' };
     const cal = google.calendar({ version: 'v3', auth });
 
@@ -599,7 +596,7 @@ async function tool_consultar_calendario(input) {
 
 async function tool_buscar_en_drive(input) {
   try {
-    const auth = getGoogleAuth(['https://www.googleapis.com/auth/drive.readonly']);
+    const auth = getGoogleAuth();
     if (!auth) return { ok: false, error: 'Drive no configurado' };
     const drive = google.drive({ version: 'v3', auth });
 
