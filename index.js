@@ -132,7 +132,13 @@ REGLAS IMPORTANTES:
 8. CONTEXTOS CON T (ej: T Ordenador, T ROCA, T < 5 min) = TRABAJO. Sin T = PERSONAL.
    Cuando Lucas pregunta por tareas "del trabajo" → filtro "trabajo"
    Cuando pregunta por tareas "personales" → filtro "personal"
-   Cuando pregunta en general → filtro "todas"`;
+   Cuando pregunta en general → filtro "todas"
+9. COLORES DE CALENDARIO al crear eventos:
+   - Reuniones de trabajo, DLP, Smart, Tuluka → colorId "9" (Laboral, azul)
+   - Personal, familia, Vito, Julia, amigos → colorId "5" (Personal, amarillo)
+   - Gym, deporte, cursos, facultad, libros → colorId "4" (Desarrollo personal, rosa)
+   - Viajes, traslados, autos → colorId "11" (Transporte, rojo)
+   - Reuniones solo vos sin equipo → colorId "9" (Laboral solo yo, azul)`;
 }
 
 // ─── Definición de herramientas ───────────────────────────────────────────────
@@ -217,7 +223,8 @@ const TOOLS = [
         hora_inicio: { type: 'string', description: 'HH:MM o null si es todo el día' },
         hora_fin: { type: 'string', description: 'HH:MM o null' },
         descripcion: { type: 'string', description: 'Descripción opcional' },
-        todo_el_dia: { type: 'boolean', description: 'true si es evento de todo el día' }
+        todo_el_dia: { type: 'boolean', description: 'true si es evento de todo el día' },
+        colorId: { type: 'string', description: 'Color: 9=Laboral (azul), 5=Personal (amarillo), 4=Desarrollo personal (rosa), 11=Transporte (rojo)' }
       },
       required: ['titulo', 'fecha']
     }
@@ -504,6 +511,7 @@ async function tool_crear_evento_calendario(input) {
     const cal = google.calendar({ version: 'v3', auth });
 
     let eventBody = { summary: input.titulo, description: input.descripcion || '' };
+  if (input.colorId) eventBody.colorId = input.colorId;
 
     if (input.todo_el_dia || !input.hora_inicio) {
       eventBody.start = { date: input.fecha };
@@ -515,17 +523,11 @@ async function tool_crear_evento_calendario(input) {
     }
 
     let resp;
-  try {
-    resp = await cal.events.insert({ calendarId: CALENDAR_ID, requestBody: eventBody });
-  } catch (e) {
-    console.error('❌ Calendar error con', CALENDAR_ID, ':', e.message);
     try {
+      resp = await cal.events.insert({ calendarId: CALENDAR_ID, requestBody: eventBody });
+    } catch (e) {
       resp = await cal.events.insert({ calendarId: 'primary', requestBody: eventBody });
-    } catch (e2) {
-      console.error('❌ Calendar error con primary:', e2.message);
-      return { ok: false, error: e2.message };
     }
-  }
 
     await guardarHistorial(`Agendó: "${input.titulo}" el ${input.fecha}`, null);
     return { ok: true, titulo: input.titulo, fecha: input.fecha, hora: input.hora_inicio, id: resp.data.id };
