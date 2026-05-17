@@ -81,17 +81,20 @@ function getBuenosAiresDateRange(periodo) {
   const TZ = 'America/Argentina/Buenos_Aires';
   const OFFSET = '-03:00';
   const hoyStr = new Date().toLocaleDateString('en-CA', { timeZone: TZ });
-  const [y, m, d] = hoyStr.split('-').map(Number);
+
+  // Anclar a mediodía Buenos Aires para sumar días sin cruces de medianoche UTC
+  const ancla = new Date(`${hoyStr}T12:00:00${OFFSET}`).getTime();
+  const DIA = 24 * 60 * 60 * 1000;
 
   if (periodo === 'hoy') {
     return { timeMin: `${hoyStr}T00:00:00${OFFSET}`, timeMax: `${hoyStr}T23:59:59${OFFSET}` };
   }
   if (periodo === 'mañana') {
-    const manStr = new Date(Date.UTC(y, m - 1, d + 1)).toLocaleDateString('en-CA', { timeZone: TZ });
+    const manStr = new Date(ancla + DIA).toLocaleDateString('en-CA', { timeZone: TZ });
     return { timeMin: `${manStr}T00:00:00${OFFSET}`, timeMax: `${manStr}T23:59:59${OFFSET}` };
   }
   // semana
-  const en7Str = new Date(Date.UTC(y, m - 1, d + 7)).toLocaleDateString('en-CA', { timeZone: TZ });
+  const en7Str = new Date(ancla + 7 * DIA).toLocaleDateString('en-CA', { timeZone: TZ });
   return { timeMin: `${hoyStr}T00:00:00${OFFSET}`, timeMax: `${en7Str}T23:59:59${OFFSET}` };
 }
 
