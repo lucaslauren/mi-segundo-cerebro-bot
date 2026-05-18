@@ -880,27 +880,64 @@ async function enviarTelegram(chatId, texto) {
 
 async function transcribirGroq(fileId) {
   try {
+    // 1. Obtener path del archivo desde Telegram
     const fileRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${fileId}`);
     const fileData = await fileRes.json();
-    if (!fileData.ok) return null;
+    if (!fileData.ok) {
+      console.error('❌ Groq: Telegram getFile falló:', JSON.stringify(fileData));
+      return null;
+    }
 
-    const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${fileData.result.file_path}`;
-    const audioRes = await fetch(fileUrl);
+    const filePath = fileData.result.file_path;
+    console.log(`🎙️ Descargando audio: ${filePath} (${fileData.result.file_size || '?'} bytes)`);
+
+    // 2. Descargar audio
+    const audioRes = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`);
+    if (!audioRes.ok) {
+      console.error(`❌ Groq: error descargando audio HTTP ${audioRes.status}`);
+      return null;
+    }
     const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
+    console.log(`🎙️ Audio descargado: ${audioBuffer.length} bytes`);
 
-    const formData = new FormData();
-    formData.append('file', new Blob([audioBuffer], { type: 'audio/ogg' }), 'audio.ogg');
-    formData.append('model', 'whisper-large-v3-turbo');
-    formData.append('language', 'es');
-    formData.append('response_format', 'json');
+    // 3. Construir multipart manualmente (más confiable que FormData nativo en Node.js)
+    const ext = filePath.split('.').pop() || 'ogg';
+    const mimeType = ext === 'm4a' ? 'audio/mp4' : `audio/${ext}`;
+    const boundary = `----Boundary${Date.now()}`;
 
+    const partsText = [
+      `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-large-v3-turbo`,
+      `--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nes`,
+      `--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson`,
+    ].join('\r\n') + '\r\n';
+
+    const fileHeader = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.${ext}"\r\nContent-Type: ${mimeType}\r\n\r\n`;
+    const closing = `\r\n--${boundary}--\r\n`;
+
+    const body = Buffer.concat([
+      Buffer.from(partsText),
+      Buffer.from(fileHeader),
+      audioBuffer,
+      Buffer.from(closing)
+    ]);
+
+    // 4. Enviar a Groq
     const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}` },
-      body: formData
+      headers: {
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': `multipart/form-data; boundary=${boundary}`
+      },
+      body
     });
 
     const data = await resp.json();
+    if (!resp.ok) {
+      console.error(`❌ Groq API error ${resp.status}:`, JSON.stringify(data));
+      return null;
+    }
+
+    console.log('✅ Transcripción OK:', data.text?.substring(0, 80));
     return data.text || null;
   } catch (e) {
     console.error('❌ Groq error:', e.message);
