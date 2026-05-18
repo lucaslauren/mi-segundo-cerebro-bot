@@ -901,7 +901,8 @@ async function transcribirGroq(fileId) {
     console.log(`🎙️ Audio descargado: ${audioBuffer.length} bytes`);
 
     // 3. Construir multipart manualmente (más confiable que FormData nativo en Node.js)
-    const ext = filePath.split('.').pop() || 'ogg';
+    const rawExt = filePath.split('.').pop() || 'ogg';
+    const ext = rawExt === 'oga' ? 'ogg' : rawExt;  // Telegram usa .oga, Groq acepta .ogg
     const mimeType = ext === 'm4a' ? 'audio/mp4' : `audio/${ext}`;
     const boundary = `----Boundary${Date.now()}`;
 
