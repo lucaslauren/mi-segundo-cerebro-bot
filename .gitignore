@@ -1,0 +1,17 @@
+# Dependencias
+node_modules/
+
+# Variables de entorno y secretos
+.env
+.env.*
+*.local
+
+# Archivos temporales / debug (no subir nunca)
+_*.js
+get-refresh-token.js
+test-calendar.js
+
+# Logs y SO
+*.log
+.DS_Store
+Thumbs.db
