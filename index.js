@@ -29,6 +29,9 @@ const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || 'lucas@dlaurenzano.com';
 const NOTION_HISTORIAL_ID = '3626046f0fee80188b21c9964d5610f7';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+// Para calcular tiempos de viaje (Routes API). Origen de referencia: oficina DLP.
+const MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_CHAT_KEY;
+const DLP_OFFICE_ADDRESS = process.env.DLP_OFFICE_ADDRESS || 'Navarro 3200, CABA, Argentina';
 
 // ─── Memoria de sesión ────────────────────────────────────────────────────────
 // Guardamos los mensajes "crudos" recientes (incluyendo bloques tool_use/tool_result)
@@ -147,6 +150,21 @@ function sumarHora(h, n) {
   const [hh, mm] = h.split(':').map(Number);
   const d = new Date(); d.setHours(hh + n, mm, 0);
   return d.toTimeString().substring(0, 5);
+}
+
+// Suma minutos a un "HH:MM" y devuelve "HH:MM" (sin cruzar de día; clamp simple).
+function sumarMinutos(h, min) {
+  const [hh, mm] = h.split(':').map(Number);
+  let total = hh * 60 + mm + min;
+  total = Math.max(0, Math.min(total, 23 * 60 + 59));
+  return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+}
+
+// Resta minutos a un "HH:MM" (clamp a 00:00).
+function restarMinutos(h, min) {
+  const [hh, mm] = h.split(':').map(Number);
+  let total = Math.max(0, hh * 60 + mm - min);
+  return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
 }
 
 // Argentina es siempre UTC-3, sin DST
@@ -297,7 +315,11 @@ REGLAS IMPORTANTES:
    - Reuniones de trabajo, DLP, Smart, Tuluka → colorId "9" (Laboral, azul)
    - Personal, familia, Vito, Julia, amigos → colorId "5" (Personal, amarillo)
    - Gym, deporte, cursos, facultad, libros → colorId "4" (Desarrollo personal, rosa)
-   - Viajes, traslados, autos → colorId "11" (Transporte, rojo)${bloqueResumen}`;
+   - Viajes, traslados, autos → colorId "11" (Transporte, rojo)
+13. CALENDARIO SIN LÍMITE DE FECHA: podés consultar cualquier día o rango futuro (o pasado), sin restricción. Para un día puntual usá "fecha"; para un rango usá "fecha_desde"+"fecha_hasta". Nunca digas que no podés ver una fecha lejana.
+14. DURACIÓN DE EVENTOS: si Lucas no aclara cuánto dura, asumí 45 minutos (no pongas hora_fin y el sistema usa 45 min por defecto).
+15. UBICACIÓN: lo que Lucas indique con "dónde", "en", "lugar" o una dirección va al campo "ubicacion" del evento (no a la descripción).
+16. VIAJE PREVIO: cuando crees un evento que tiene ubicación (y no es en la oficina), PREGUNTALE a Lucas si querés que le cree el "Viaje a [evento]" previo. Si dice que sí, usá crear_evento_viaje (calcula el tiempo de manejo con tráfico desde la oficina DLP, Navarro 3200, hasta el destino, y crea el evento de viaje terminando justo a la hora de inicio del evento). El origen del viaje SIEMPRE es la oficina DLP.${bloqueResumen}`;
 }
 
 // ─── Definición de herramientas ───────────────────────────────────────────────
@@ -421,6 +443,7 @@ const TOOLS = [
         hora_inicio: { type: 'string', description: 'HH:MM o null si es todo el día' },
         hora_fin: { type: 'string', description: 'HH:MM o null' },
         descripcion: { type: 'string', description: 'Descripción opcional' },
+        ubicacion: { type: 'string', description: 'Ubicación/dirección del evento (lo que Lucas diga con "dónde/en"). Va al campo Ubicación de Google Calendar.' },
         todo_el_dia: { type: 'boolean', description: 'true si es evento de todo el día' },
         colorId: { type: 'string', description: 'Color: 9=Laboral (azul), 5=Personal (amarillo), 4=Desarrollo personal (rosa), 11=Transporte (rojo)' }
       },
@@ -428,17 +451,33 @@ const TOOLS = [
     }
   },
   {
+    name: 'crear_evento_viaje',
+    description: 'Crea un evento "Viaje a [evento]" ANTES de otro evento, calculando el tiempo de manejo con tráfico desde la oficina de DLP (Navarro 3200) hasta el destino. Usalo cuando Lucas confirma que quiere el viaje previo.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        destino: { type: 'string', description: 'Dirección/ubicación de destino (la del evento al que viaja)' },
+        nombre_evento_destino: { type: 'string', description: 'Nombre del evento al que viaja (para el título "Viaje a ...")' },
+        fecha: { type: 'string', description: 'Fecha del evento destino YYYY-MM-DD' },
+        hora_llegada: { type: 'string', description: 'Hora de inicio del evento destino HH:MM (a la que tiene que llegar)' }
+      },
+      required: ['destino', 'nombre_evento_destino', 'fecha', 'hora_llegada']
+    }
+  },
+  {
     name: 'consultar_calendario',
-    description: 'Consulta eventos del calendario de Lucas. Podés usar "periodo" (hoy/mañana/semana) o "fecha" para un día puntual.',
+    description: 'Consulta eventos del calendario de Lucas. SIN límite de fecha: podés consultar cualquier día o rango futuro (o pasado). Usá "periodo" (hoy/mañana/semana), "fecha" para un día puntual, o "fecha_desde"+"fecha_hasta" para un rango.',
     input_schema: {
       type: 'object',
       properties: {
         periodo: {
           type: 'string',
           enum: ['hoy', 'mañana', 'semana'],
-          description: 'Período a consultar (ignorado si pasás "fecha")'
+          description: 'Período a consultar (ignorado si pasás "fecha" o un rango)'
         },
-        fecha: { type: 'string', description: 'Fecha puntual YYYY-MM-DD (tiene prioridad sobre periodo)' }
+        fecha: { type: 'string', description: 'Fecha puntual YYYY-MM-DD (un solo día)' },
+        fecha_desde: { type: 'string', description: 'Inicio del rango YYYY-MM-DD' },
+        fecha_hasta: { type: 'string', description: 'Fin del rango YYYY-MM-DD' }
       },
       required: []
     }
@@ -798,13 +837,15 @@ async function tool_crear_evento_calendario(input) {
     const cal = google.calendar({ version: 'v3', auth });
 
     let eventBody = { summary: input.titulo, description: input.descripcion || '' };
-  if (input.colorId) eventBody.colorId = input.colorId;
+    if (input.colorId) eventBody.colorId = input.colorId;
+    if (input.ubicacion) eventBody.location = input.ubicacion;
 
     if (input.todo_el_dia || !input.hora_inicio) {
       eventBody.start = { date: input.fecha };
       eventBody.end = { date: input.fecha };
     } else {
-      const fin = input.hora_fin || sumarHora(input.hora_inicio, 1);
+      // Duración por defecto: 45 minutos si no se aclara hora_fin.
+      const fin = input.hora_fin || sumarMinutos(input.hora_inicio, 45);
       eventBody.start = { dateTime: `${input.fecha}T${input.hora_inicio}:00`, timeZone: 'America/Argentina/Buenos_Aires' };
       eventBody.end = { dateTime: `${input.fecha}T${fin}:00`, timeZone: 'America/Argentina/Buenos_Aires' };
     }
@@ -817,7 +858,94 @@ async function tool_crear_evento_calendario(input) {
     }
 
     await guardarHistorial(`Agendó: "${input.titulo}" el ${input.fecha}`, null);
-    return { ok: true, titulo: input.titulo, fecha: input.fecha, hora: input.hora_inicio, id: resp.data.id };
+    return { ok: true, titulo: input.titulo, fecha: input.fecha, hora: input.hora_inicio, ubicacion: input.ubicacion || null, id: resp.data.id };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// Calcula minutos de manejo con tráfico desde la oficina DLP hasta un destino,
+// usando la Routes API (nueva). Devuelve { minutos, km } o { error }.
+async function calcularViajeDesdeOficina(destino, salidaISO) {
+  if (!MAPS_API_KEY) return { error: 'Falta GOOGLE_MAPS_API_KEY' };
+  try {
+    // departureTime debe ser futuro; si la salida calculada quedó en el pasado, usamos +2 min.
+    let departureTime = salidaISO;
+    if (!departureTime || new Date(departureTime).getTime() <= Date.now()) {
+      departureTime = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+    }
+    const resp = await fetch('https://routes.googleapis.com/directions/v2:computeRoutes', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': MAPS_API_KEY,
+        'X-Goog-FieldMask': 'routes.duration,routes.distanceMeters'
+      },
+      body: JSON.stringify({
+        origin: { address: DLP_OFFICE_ADDRESS },
+        destination: { address: destino },
+        travelMode: 'DRIVE',
+        routingPreference: 'TRAFFIC_AWARE',
+        departureTime
+      })
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.routes?.length) {
+      const msg = data.error?.message || `HTTP ${resp.status}`;
+      console.error('⚠️ Routes API:', msg);
+      return { error: msg };
+    }
+    const dur = data.routes[0].duration; // ej "1234s"
+    const segs = parseInt(String(dur).replace('s', ''), 10) || 0;
+    const minutos = Math.ceil(segs / 60);
+    const km = Math.round((data.routes[0].distanceMeters || 0) / 100) / 10;
+    return { minutos, km };
+  } catch (e) {
+    console.error('⚠️ calcularViajeDesdeOficina:', e.message);
+    return { error: e.message };
+  }
+}
+
+async function tool_crear_evento_viaje(input) {
+  try {
+    const auth = getGoogleAuth();
+    if (!auth) return { ok: false, error: 'Calendar no configurado' };
+
+    // Salida estimada = llegada - 60 min (solo para el departureTime del cálculo de tráfico).
+    const salidaEstimada = restarMinutos(input.hora_llegada, 60);
+    const salidaISO = `${input.fecha}T${salidaEstimada}:00-03:00`;
+    const viaje = await calcularViajeDesdeOficina(input.destino, salidaISO);
+    if (viaje.error) {
+      return { ok: false, error: `No pude calcular el viaje: ${viaje.error}`, necesita_routes_api: true };
+    }
+
+    // El viaje termina justo a la hora de llegada y arranca "minutos" antes (+5 de margen).
+    const minutosConMargen = viaje.minutos + 5;
+    const horaInicioViaje = restarMinutos(input.hora_llegada, minutosConMargen);
+
+    const cal = google.calendar({ version: 'v3', auth });
+    const eventBody = {
+      summary: `🚗 Viaje a ${input.nombre_evento_destino}`,
+      description: `Desde ${DLP_OFFICE_ADDRESS} hasta ${input.destino}.\nTiempo estimado con tráfico: ${viaje.minutos} min (${viaje.km} km) + 5 min de margen.`,
+      location: input.destino,
+      colorId: '11', // Transporte (rojo)
+      start: { dateTime: `${input.fecha}T${horaInicioViaje}:00`, timeZone: 'America/Argentina/Buenos_Aires' },
+      end: { dateTime: `${input.fecha}T${input.hora_llegada}:00`, timeZone: 'America/Argentina/Buenos_Aires' }
+    };
+
+    let resp;
+    try {
+      resp = await cal.events.insert({ calendarId: CALENDAR_ID, requestBody: eventBody });
+    } catch (e) {
+      resp = await cal.events.insert({ calendarId: 'primary', requestBody: eventBody });
+    }
+
+    await guardarHistorial(`Agendó viaje a "${input.nombre_evento_destino}" (${viaje.minutos} min)`, null);
+    return {
+      ok: true, titulo: eventBody.summary, fecha: input.fecha,
+      hora_inicio: horaInicioViaje, hora_fin: input.hora_llegada,
+      minutos_viaje: viaje.minutos, km: viaje.km, id: resp.data.id
+    };
   } catch (e) {
     return { ok: false, error: e.message };
   }
@@ -829,26 +957,35 @@ async function tool_consultar_calendario(input) {
     if (!auth) return { ok: false, error: 'Calendar no configurado' };
     const cal = google.calendar({ version: 'v3', auth });
 
-    // Si viene "fecha" puntual, armamos el rango de ese día; si no, usamos el periodo.
-    let timeMin, timeMax;
-    if (input.fecha && /^\d{4}-\d{2}-\d{2}/.test(input.fecha)) {
+    // Sin límite de fecha: rango explícito > fecha puntual > periodo.
+    let timeMin, timeMax, etiqueta;
+    const esFecha = s => s && /^\d{4}-\d{2}-\d{2}/.test(s);
+    if (esFecha(input.fecha_desde) || esFecha(input.fecha_hasta)) {
+      const desde = esFecha(input.fecha_desde) ? input.fecha_desde.substring(0, 10) : fechaISO();
+      const hasta = esFecha(input.fecha_hasta) ? input.fecha_hasta.substring(0, 10) : desde;
+      timeMin = `${desde}T00:00:00-03:00`;
+      timeMax = `${hasta}T23:59:59-03:00`;
+      etiqueta = `${desde}→${hasta}`;
+    } else if (esFecha(input.fecha)) {
       const d = input.fecha.substring(0, 10);
       timeMin = `${d}T00:00:00-03:00`;
       timeMax = `${d}T23:59:59-03:00`;
+      etiqueta = d;
     } else {
       ({ timeMin, timeMax } = getBuenosAiresDateRange(input.periodo || 'hoy'));
+      etiqueta = input.periodo || 'hoy';
     }
-    console.log(`📅 Calendar query: ${input.fecha || input.periodo || 'hoy'} | ${timeMin} → ${timeMax} | calendarId=${CALENDAR_ID}`);
+    console.log(`📅 Calendar query: ${etiqueta} | ${timeMin} → ${timeMax} | calendarId=${CALENDAR_ID}`);
 
     let eventos = [];
     try {
-      const resp = await cal.events.list({ calendarId: CALENDAR_ID, timeMin, timeMax, singleEvents: true, orderBy: 'startTime', maxResults: 20 });
+      const resp = await cal.events.list({ calendarId: CALENDAR_ID, timeMin, timeMax, singleEvents: true, orderBy: 'startTime', maxResults: 100 });
       eventos = resp.data.items || [];
       console.log(`📅 Eventos (${CALENDAR_ID}): ${eventos.length}`);
     } catch (e) {
       console.error(`⚠️ Calendar error con calendarId=${CALENDAR_ID}: ${e.message}`);
       try {
-        const resp = await cal.events.list({ calendarId: 'primary', timeMin, timeMax, singleEvents: true, orderBy: 'startTime', maxResults: 20 });
+        const resp = await cal.events.list({ calendarId: 'primary', timeMin, timeMax, singleEvents: true, orderBy: 'startTime', maxResults: 100 });
         eventos = resp.data.items || [];
         console.log(`📅 Eventos (primary fallback): ${eventos.length}`);
       } catch (e2) {
@@ -858,12 +995,13 @@ async function tool_consultar_calendario(input) {
     }
 
     return {
-      periodo: input.fecha || input.periodo || 'hoy',
+      periodo: etiqueta,
       cantidad: eventos.length,
       eventos: eventos.map(e => ({
         titulo: e.summary,
         fecha: e.start.date || e.start.dateTime?.split('T')[0],
         hora: e.start.dateTime ? new Date(e.start.dateTime).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Argentina/Buenos_Aires' }) : 'Todo el día',
+        ubicacion: e.location || null,
         id: e.id
       }))
     };
@@ -1047,6 +1185,7 @@ async function ejecutarHerramienta(nombre, input) {
     case 'crear_proyecto':            return await tool_crear_proyecto(input);
     case 'consultar_proyectos':       return await tool_consultar_proyectos(input);
     case 'crear_evento_calendario':   return await tool_crear_evento_calendario(input);
+    case 'crear_evento_viaje':        return await tool_crear_evento_viaje(input);
     case 'consultar_calendario':      return await tool_consultar_calendario(input);
     case 'eliminar_evento_calendario': return await tool_eliminar_evento_calendario(input);
     case 'eliminar_tarea_notion':     return await tool_eliminar_tarea_notion(input);
