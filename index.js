@@ -18,7 +18,8 @@ const app = express();
 app.use(bodyParser.json({ limit: '10mb' }));
 
 // ─── Clientes ────────────────────────────────────────────────────────────────
-const anthropic = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
+// maxRetries: el SDK reintenta 429/5xx con backoff exponencial respetando el header retry-after.
+const anthropic = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY, maxRetries: 4 });
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 const NOTION_DB_ID = process.env.NOTION_DATABASE_ID;
@@ -504,7 +505,11 @@ const TOOLS = [
       type: 'object',
       properties: {},
       required: []
-    }
+    },
+    // cache_control en la ÚLTIMA tool: cachea todo el bloque de tools (se renderiza
+    // antes que system y messages). Las lecturas de cache no cuentan para el límite ITPM.
+    // Si agregás tools nuevas, mové este cache_control a la nueva última tool.
+    cache_control: { type: 'ephemeral' }
   }
 ];
 
@@ -1102,12 +1107,16 @@ async function procesarConClaude(chatId, userText) {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 4096,
-      system: buildSystemPrompt(obtenerResumen(chatId)),
+      // system como bloque con cache_control: cachea tools + system (prefijo estable).
+      // En el loop de tool use, la 1ª iteración escribe el cache y las siguientes lo leen;
+      // las lecturas de cache NO cuentan para el límite ITPM en Sonnet 4.x.
+      system: [{ type: 'text', text: buildSystemPrompt(obtenerResumen(chatId)), cache_control: { type: 'ephemeral' } }],
       tools: TOOLS,
       messages: mensajes
     });
 
-    console.log(`🤖 Claude stop_reason: ${response.stop_reason}`);
+    const u = response.usage;
+    console.log(`🤖 stop_reason: ${response.stop_reason} | cache write: ${u?.cache_creation_input_tokens || 0} read: ${u?.cache_read_input_tokens || 0} input: ${u?.input_tokens || 0}`);
 
     if (response.stop_reason === 'end_turn') {
       // Claude terminó — extraer texto de respuesta
