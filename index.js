@@ -1105,7 +1105,7 @@ async function procesarConClaude(chatId, userText) {
     iteraciones++;
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 4096,
       // system como bloque con cache_control: cachea tools + system (prefijo estable).
       // En el loop de tool use, la 1ª iteración escribe el cache y las siguientes lo leen;
