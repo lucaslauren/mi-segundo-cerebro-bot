@@ -1,26 +1,43 @@
 /**
- * SEGUNDO CEREBRO BOT v6.0
+ * SEGUNDO CEREBRO BOT v7.0
  * Secretario personal de Lucas Hernán Laurenzano
  *
  * Arquitectura: Tool Use nativo de Claude
  * Claude decide qué herramientas usar en cada conversación.
  * No hay intenciones predefinidas ni JSON estructurado.
+ *
+ * v7.0 (2026-07-28): optimizaciones portadas del bot Caja Hermanos —
+ * procesamiento dentro del request, prompt caching con ttl 1h, prefetch de
+ * Notion en paralelo con Claude, whitelist + secret token del webhook,
+ * dedupe de updates, entrega garantizada a Telegram y warm-up al arrancar.
  */
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const Anthropic = require('@anthropic-ai/sdk');
 const { Client } = require('@notionhq/client');
-const { google } = require('googleapis');
+// Carga selectiva: require('googleapis') completo tarda ~2,4 s (112 MB) y era la
+// mayor parte del cold start. Cargar solo auth + calendar + drive tarda ~0,3 s.
+const { OAuth2Client } = require('google-auth-library');
+const { calendar: calendarApi } = require('googleapis/build/src/apis/calendar');
+const { drive: driveApi } = require('googleapis/build/src/apis/drive');
 require('dotenv').config();
 
 const app = express();
 app.use(bodyParser.json({ limit: '10mb' }));
 
 // ─── Clientes ────────────────────────────────────────────────────────────────
-// maxRetries: el SDK reintenta 429/5xx con backoff exponencial respetando el header retry-after.
-const anthropic = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY, maxRetries: 4 });
+// timeout 30 s: mejor fallar rápido y visible que dejar a Lucas esperando los
+// 10 minutos del default del SDK. maxRetries 2 por la misma razón (el SDK
+// reintenta 429/5xx con backoff exponencial respetando el header retry-after).
+const anthropic = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY, timeout: 30_000, maxRetries: 2 });
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
+
+// Modelo por env para poder cambiarlo sin tocar código (y que /health no mienta).
+// Sonnet 5 con thinking adaptive: acá se agenda y se borran tareas reales, y la
+// diferencia de costo es marginal con el volumen de un solo usuario.
+const MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-5';
+const EFFORT = process.env.CLAUDE_EFFORT || 'medium';
 
 const NOTION_DB_ID = process.env.NOTION_DATABASE_ID;
 // Base P.A.R.A (Proyectos/Areas/Recursos/Archivados). El env var NOTION_PROJECTS_DATABASE_ID
@@ -35,9 +52,10 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 // Guardamos los mensajes "crudos" recientes (incluyendo bloques tool_use/tool_result)
 // y, cuando se pasan del límite, los más viejos se compactan en un resumen de texto
 // que se inyecta en el system prompt. Así el contexto es largo y nunca se pierde del todo.
-const memoriaSession = new Map();   // chatId -> array de mensajes Anthropic
-const resumenSession = new Map();   // chatId -> string (resumen de lo más viejo)
-const KEEP_MSGS = 30;               // mensajes crudos recientes que mantenemos
+const memoriaSession = new Map();       // chatId -> array de mensajes Anthropic
+const resumenSession = new Map();       // chatId -> string (resumen de lo más viejo)
+const pendientesCompactar = new Map();  // chatId -> mensajes descartados aún sin resumir
+const KEEP_MSGS = 30;                   // mensajes crudos recientes que mantenemos
 
 function obtenerHistorial(chatId) {
   return memoriaSession.get(chatId) || [];
@@ -93,8 +111,14 @@ function mensajesATexto(mensajes) {
 
 // Compacta (resumen previo + mensajes descartados) en un nuevo resumen conciso.
 // Usa Haiku para no encarecer; si falla, cae a una concatenación heurística acotada.
-async function compactarResumen(chatId, descartados) {
-  if (!descartados.length) return;
+//
+// Se llama DESPUÉS de responderle a Lucas (fuera de la ruta crítica): antes se
+// hacía en medio del turno y le sumaba una llamada entera a la espera.
+// procesarConClaude solo deja lo pendiente anotado en pendientesCompactar.
+async function compactarPendiente(chatId) {
+  const descartados = pendientesCompactar.get(chatId);
+  if (!descartados || !descartados.length) return;
+  pendientesCompactar.delete(chatId);
   const previo = obtenerResumen(chatId);
   const nuevoTexto = mensajesATexto(descartados);
   try {
@@ -117,19 +141,40 @@ async function compactarResumen(chatId, descartados) {
 }
 
 // ─── Google Auth ──────────────────────────────────────────────────────────────
+// El cliente OAuth y los clientes de API se construyen una sola vez: rearmarlos
+// en cada tool obliga a rehacer el handshake TLS y a refrescar el access token.
+let authCache = null;
 function getGoogleAuth() {
+  if (authCache) return authCache;
   try {
     const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
     const refreshToken = process.env.GOOGLE_OAUTH_REFRESH_TOKEN;
     if (!clientId || !clientSecret || !refreshToken) return null;
-    const auth = new google.auth.OAuth2(clientId, clientSecret);
+    const auth = new OAuth2Client(clientId, clientSecret);
     auth.setCredentials({ refresh_token: refreshToken });
+    authCache = auth;
     return auth;
   } catch (e) {
     console.error('⚠️ Google Auth error:', e.message);
     return null;
   }
+}
+
+let calendarCache = null;
+function getCalendar() {
+  const auth = getGoogleAuth();
+  if (!auth) return null;
+  if (!calendarCache) calendarCache = calendarApi({ version: 'v3', auth });
+  return calendarCache;
+}
+
+let driveCache = null;
+function getDrive() {
+  const auth = getGoogleAuth();
+  if (!auth) return null;
+  if (!driveCache) driveCache = driveApi({ version: 'v3', auth });
+  return driveCache;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -250,14 +295,14 @@ function mapTarea(page) {
 }
 
 // ─── System Prompt ────────────────────────────────────────────────────────────
-function buildSystemPrompt(resumen) {
-  const bloqueResumen = resumen
-    ? `\n\nRESUMEN DE LA CONVERSACIÓN PREVIA (memoria de largo plazo, no la pierdas):\n${resumen}\n`
-    : '';
-
+// PROMPT CACHING: el prefijo se cachea por bytes exactos, así que el system está
+// partido en dos bloques: uno ESTABLE (todo lo que no cambia nunca, con el
+// breakpoint de cache y ttl 1h) y uno VOLÁTIL (la fecha, sin cache). El resumen
+// de conversación NO va en el system: cambiaría el prefijo cada vez que se
+// compacta e invalidaría el cache. Va como primer mensaje user.
+// ⚠️ No usar {role:'system'} dentro de messages: Sonnet 5 no lo soporta (400).
+function buildBloqueEstable() {
   return `Sos el secretario personal IA de Lucas Hernán Laurenzano.
-
-FECHA Y HORA ACTUAL: ${fechaHoy()}
 
 QUIÉN ES LUCAS:
 - CEO de DLP (Daniel Laurenzano Propiedades) - inmobiliaria
@@ -309,8 +354,11 @@ REGLAS IMPORTANTES:
    - Viajes, traslados, autos → colorId "11" (Transporte, rojo)
 13. CALENDARIO SIN LÍMITE DE FECHA: podés consultar cualquier día o rango futuro (o pasado), sin restricción. Para un día puntual usá "fecha"; para un rango usá "fecha_desde"+"fecha_hasta". Nunca digas que no podés ver una fecha lejana.
 14. DURACIÓN DE EVENTOS: si Lucas no aclara cuánto dura, asumí 45 minutos (no pongas hora_fin y el sistema usa 45 min por defecto).
-15. UBICACIÓN: lo que Lucas indique con "dónde", "en", "lugar" o una dirección va al campo "ubicacion" del evento (no a la descripción).${bloqueResumen}`;
+15. UBICACIÓN: lo que Lucas indique con "dónde", "en", "lugar" o una dirección va al campo "ubicacion" del evento (no a la descripción).`;
 }
+
+// Se arma una sola vez: es constante, y recalcularlo no aportaría nada.
+const BLOQUE_ESTABLE = buildBloqueEstable();
 
 // ─── Definición de herramientas ───────────────────────────────────────────────
 const TOOLS = [
@@ -812,9 +860,8 @@ async function tool_editar_tarea(input) {
 
 async function tool_crear_evento_calendario(input) {
   try {
-    const auth = getGoogleAuth();
-    if (!auth) return { ok: false, error: 'Calendar no configurado' };
-    const cal = google.calendar({ version: 'v3', auth });
+    const cal = getCalendar();
+    if (!cal) return { ok: false, error: 'Calendar no configurado' };
 
     let eventBody = { summary: input.titulo, description: input.descripcion || '' };
     if (input.colorId) eventBody.colorId = input.colorId;
@@ -846,9 +893,8 @@ async function tool_crear_evento_calendario(input) {
 
 async function tool_consultar_calendario(input) {
   try {
-    const auth = getGoogleAuth();
-    if (!auth) return { ok: false, error: 'Calendar no configurado' };
-    const cal = google.calendar({ version: 'v3', auth });
+    const cal = getCalendar();
+    if (!cal) return { ok: false, error: 'Calendar no configurado' };
 
     // Sin límite de fecha: rango explícito > fecha puntual > periodo.
     let timeMin, timeMax, etiqueta;
@@ -906,9 +952,8 @@ async function tool_consultar_calendario(input) {
 
 async function tool_buscar_en_drive(input) {
   try {
-    const auth = getGoogleAuth();
-    if (!auth) return { ok: false, error: 'Drive no configurado' };
-    const drive = google.drive({ version: 'v3', auth });
+    const drive = getDrive();
+    if (!drive) return { ok: false, error: 'Drive no configurado' };
 
     let queryParts = [`fullText contains '${input.query}' or name contains '${input.query}'`];
 
@@ -957,9 +1002,8 @@ async function tool_plan_del_dia() {
 
 async function tool_eliminar_evento_calendario(input) {
   try {
-    const auth = getGoogleAuth();
-    if (!auth) return { ok: false, error: 'Calendar no configurado' };
-    const cal = google.calendar({ version: 'v3', auth });
+    const cal = getCalendar();
+    if (!cal) return { ok: false, error: 'Calendar no configurado' };
 
     // Con id confirmado → borrar directo.
     if (input.id) {
@@ -1097,26 +1141,44 @@ async function procesarConClaude(chatId, userText) {
     { role: 'user', content: userText }
   ];
 
+  const bloqueFecha = `FECHA Y HORA ACTUAL: ${fechaHoy()} (${fechaISO()})`;
+
+  // El resumen de conversación va como primer mensaje user (NO en el system:
+  // cambiaría el prefijo cacheado). Es sintético: no se guarda en el historial.
+  const resumen = obtenerResumen(chatId);
+  const prefijo = resumen
+    ? [{ role: 'user', content: `<contexto_previo>\nResumen de la conversación anterior (memoria de largo plazo, no la pierdas):\n${resumen}\n</contexto_previo>` }]
+    : [];
+
   let respuestaFinal = null;
   let iteraciones = 0;
   const MAX_ITERACIONES = 8;
+  const tiempos = [];
 
   while (iteraciones < MAX_ITERACIONES) {
     iteraciones++;
+    const t = Date.now();
 
     const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 4096,
-      // system como bloque con cache_control: cachea tools + system (prefijo estable).
-      // En el loop de tool use, la 1ª iteración escribe el cache y las siguientes lo leen;
-      // las lecturas de cache NO cuentan para el límite ITPM en Sonnet 4.x.
-      system: [{ type: 'text', text: buildSystemPrompt(obtenerResumen(chatId)), cache_control: { type: 'ephemeral' } }],
+      model: MODEL,
+      // Con thinking activo, max_tokens limita razonamiento + respuesta juntos.
+      max_tokens: 8192,
+      thinking: { type: 'adaptive' },
+      output_config: { effort: EFFORT },
+      // El breakpoint de cache va en el último bloque estable: cachea tools +
+      // system de una (el orden de render es tools → system → messages).
+      // ⚠️ Si algún día se cachean las tools, el ttl tiene que coincidir con éste.
+      system: [
+        { type: 'text', text: BLOQUE_ESTABLE, cache_control: { type: 'ephemeral', ttl: '1h' } },
+        { type: 'text', text: bloqueFecha }
+      ],
       tools: TOOLS,
-      messages: mensajes
+      messages: [...prefijo, ...mensajes]
     });
 
+    tiempos.push(Date.now() - t);
     const u = response.usage;
-    console.log(`🤖 stop_reason: ${response.stop_reason} | cache write: ${u?.cache_creation_input_tokens || 0} read: ${u?.cache_read_input_tokens || 0} input: ${u?.input_tokens || 0}`);
+    console.log(`🤖 iter ${iteraciones}: ${Date.now() - t} ms | stop: ${response.stop_reason} | cache write: ${u?.cache_creation_input_tokens || 0} read: ${u?.cache_read_input_tokens || 0} input: ${u?.input_tokens || 0} output: ${u?.output_tokens || 0}`);
 
     if (response.stop_reason === 'end_turn') {
       // Claude terminó — extraer texto de respuesta
@@ -1153,12 +1215,15 @@ async function procesarConClaude(chatId, userText) {
     }
   }
 
-  // Recorte seguro (sin tool_result huérfanos) + compactación de lo que sale.
+  console.log(`⏱ claude total: ${tiempos.reduce((a, b) => a + b, 0)} ms en ${tiempos.length} llamada/s`);
+
+  // Recorte seguro (sin tool_result huérfanos); la compactación queda anotada
+  // para después de responder (ver compactarPendiente en el webhook).
   const { ventana, descartados } = recortarSeguro(mensajes);
   memoriaSession.set(chatId, ventana);
   if (descartados.length) {
-    try { await compactarResumen(chatId, descartados); }
-    catch (e) { console.error('⚠️ compactarResumen:', e.message); }
+    const previos = pendientesCompactar.get(chatId) || [];
+    pendientesCompactar.set(chatId, [...previos, ...descartados]);
   }
 
   return respuestaFinal || '❌ No pude procesar tu mensaje.';
@@ -1192,35 +1257,116 @@ async function guardarHistorial(texto, contexto) {
 }
 
 // ─── Telegram ─────────────────────────────────────────────────────────────────
-async function enviarTelegram(chatId, texto) {
-  try {
-    // Limpiar markdown de Claude que Telegram no entiende
-    const textoLimpio = texto
-      .replace(/\*\*(.*?)\*\*/g, '*$1*')  // Bold
-      .replace(/#{1,3} /g, '')             // Headers
-      .substring(0, 4096);                 // Límite Telegram
-
-    const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: textoLimpio,
-        parse_mode: 'Markdown'
-      })
-    });
-    const data = await resp.json();
-    if (!data.ok) {
-      // Si falla con Markdown, intentar sin formato
-      await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+// Entrega garantizada: la red hacia api.telegram.org corta seguido, y una
+// respuesta perdida acá no es solo molesta — Lucas se queda sin saber si la
+// tarea se creó o el evento se borró. Dos capas: reintentos con espera
+// creciente, y una cola que sigue insistiendo cuando el corte dura más.
+async function postTelegram(metodo, payload, intentos = 4) {
+  let ultimoError = null;
+  for (let i = 1; i <= intentos; i++) {
+    try {
+      const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${metodo}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text: texto.substring(0, 4096) })
+        body: JSON.stringify(payload)
       });
+      return await resp.json();
+    } catch (e) {
+      ultimoError = e;
+      if (i < intentos) await new Promise(r => setTimeout(r, 1500 * i));
     }
-  } catch (e) {
-    console.error('❌ Error Telegram:', e.message);
   }
+  console.error(`⚠️ Telegram ${metodo} falló tras ${intentos} intentos: ${ultimoError?.message}`);
+  return { ok: false, error_local: ultimoError?.message };
+}
+
+// Cola de mensajes que no se pudieron entregar. Se reintenta hasta 30 min.
+const pendientes = [];
+const MAX_PENDIENTES = 100;
+const REINTENTO_MS = 20000;
+const VIDA_MAX_MS = 30 * 60 * 1000;
+let flusherActivo = false;
+
+function encolar(chatId, texto) {
+  if (pendientes.length >= MAX_PENDIENTES) pendientes.shift();
+  pendientes.push({ chatId, texto, desde: Date.now() });
+  console.log(`📬 Encolado para reintento (${pendientes.length} pendiente/s)`);
+  iniciarFlusher();
+}
+
+function iniciarFlusher() {
+  if (flusherActivo) return;
+  flusherActivo = true;
+  const timer = setInterval(async () => {
+    if (!pendientes.length) { clearInterval(timer); flusherActivo = false; return; }
+    const item = pendientes.shift();
+    if (Date.now() - item.desde > VIDA_MAX_MS) {
+      console.error('❌ Mensaje descartado tras 30 min sin poder entregarlo');
+      return;
+    }
+    const r = await intentarEnvio(item.chatId, item.texto);
+    if (r === 'ok') console.log(`✅ Mensaje pendiente entregado (${pendientes.length} restante/s)`);
+    else if (r === 'red') pendientes.unshift(item); // sigue primero en la cola
+    // 'permanente': se descarta, reintentar no va a ayudar
+  }, REINTENTO_MS);
+  timer.unref?.();
+}
+
+// Devuelve 'ok', 'red' (falla de red — reintentable) o 'permanente'
+// (Telegram rechazó el mensaje: chat inexistente, bot bloqueado).
+async function intentarEnvio(chatId, texto) {
+  // Limpiar markdown de Claude que Telegram no entiende
+  const textoLimpio = texto
+    .replace(/\*\*(.*?)\*\*/g, '*$1*')  // Bold
+    .replace(/#{1,3} /g, '')             // Headers
+    .substring(0, 4096);                 // Límite Telegram
+
+  const data = await postTelegram('sendMessage', {
+    chat_id: chatId, text: textoLimpio, parse_mode: 'Markdown',
+    link_preview_options: { is_disabled: true }
+  });
+  if (data.ok) return 'ok';
+  if (data.error_local) return 'red';
+
+  // Markdown mal balanceado: Telegram rechaza con 400. Reintentar sin formato.
+  const plano = await postTelegram('sendMessage', {
+    chat_id: chatId, text: texto.substring(0, 4096),
+    link_preview_options: { is_disabled: true }
+  });
+  if (plano.ok) return 'ok';
+  if (plano.error_local) return 'red';
+  console.error(`❌ Telegram rechazó el mensaje para ${chatId}: ${plano.description || data.description || '?'}`);
+  return 'permanente';
+}
+
+async function enviarTelegram(chatId, texto) {
+  const r = await intentarEnvio(chatId, texto);
+  if (r === 'red') encolar(chatId, texto); // solo cortes de red van a la cola
+  return r === 'ok';
+}
+
+// Drenaje oportunista: en Cloud Run con CPU throttling el setInterval no corre
+// entre requests, así que cada request nuevo intenta vaciar la cola pendiente.
+async function drenarPendientes() {
+  while (pendientes.length) {
+    const item = pendientes.shift();
+    if (Date.now() - item.desde > VIDA_MAX_MS) continue;
+    const r = await intentarEnvio(item.chatId, item.texto);
+    if (r === 'red') { pendientes.unshift(item); break; }
+    if (r === 'ok') console.log(`✅ Mensaje pendiente entregado en drenaje (${pendientes.length} restante/s)`);
+  }
+}
+
+// Warm-up al arrancar: abre la conexión TLS con Telegram para que el primer
+// mensaje real no pague el handshake.
+function warmupTelegram() {
+  return postTelegram('getMe', {}, 1);
+}
+
+// "escribiendo…" mientras Claude procesa (expira solo a los ~5 s, se puede
+// llamar repetido). Falla en silencio: es solo feedback visual.
+async function accionEscribiendo(chatId) {
+  await postTelegram('sendChatAction', { chat_id: chatId, action: 'typing' }, 1);
 }
 
 async function transcribirGroq(fileId) {
@@ -1291,52 +1437,125 @@ async function transcribirGroq(fileId) {
   }
 }
 
-// ─── Webhook Telegram ─────────────────────────────────────────────────────────
-app.post('/webhook/telegram', async (req, res) => {
-  res.status(200).send('');
+// ─── Autorización ─────────────────────────────────────────────────────────────
+const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
+const ALLOWED_USER_IDS = (process.env.TELEGRAM_ALLOWED_USER_IDS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+// Este bot tiene acceso de escritura al Notion y al Calendar de Lucas: un
+// desconocido que encuentre el bot no puede quedar habilitado a usarlo.
+// Sin whitelist configurada se deja pasar (fase de setup, para descubrir el
+// user id por logs); en producción TELEGRAM_ALLOWED_USER_IDS va sí o sí.
+function autorizado(message) {
+  if (!ALLOWED_USER_IDS.length) return true;
+  return ALLOWED_USER_IDS.includes(String(message.from?.id || ''));
+}
+
+// ─── Deduplicación de updates ─────────────────────────────────────────────────
+// Telegram reintenta el webhook si no respondemos a tiempo; sin esto, un
+// reintento puede crear la misma tarea dos veces o borrar dos eventos.
+// ⚠️ Vive en memoria: solo funciona con UNA instancia. Si algún día se sube
+// max-instances, hay que mover el dedupe a almacenamiento compartido.
+const updatesVistos = new Set();
+const MAX_UPDATES_VISTOS = 500;
+function esDuplicado(updateId) {
+  if (updateId === undefined) return false;
+  if (updatesVistos.has(updateId)) return true;
+  updatesVistos.add(updateId);
+  if (updatesVistos.size > MAX_UPDATES_VISTOS) {
+    updatesVistos.delete(updatesVistos.values().next().value);
+  }
+  return false;
+}
+
+// ─── Handler de updates (compartido por webhook y dev-polling) ───────────────
+async function manejarUpdate(update) {
+  const message = update.message || update.edited_message;
+  if (!message) return;
+
+  if (esDuplicado(update.update_id)) {
+    console.log(`🔁 Update duplicado ignorado: ${update.update_id}`);
+    return;
+  }
+
+  // Si quedaron mensajes sin entregar de antes, aprovechar este request.
+  drenarPendientes().catch(() => {});
+
+  const chatId = message.chat.id;
+  const fromId = message.from?.id;
+
+  if (!autorizado(message)) {
+    console.log(`⛔ No autorizado: user ${fromId} (${message.from?.first_name}) en chat ${chatId}`);
+    if (message.chat.type === 'private') await enviarTelegram(chatId, '🔒 Este bot es privado.');
+    return;
+  }
+
+  const t0 = Date.now();
+  let userText = null;
+
+  if (message.text) {
+    userText = message.text.trim();
+  } else if (message.voice || message.audio) {
+    const fileId = message.voice?.file_id || message.audio?.file_id;
+    if (fileId) {
+      void accionEscribiendo(chatId);
+      userText = await transcribirGroq(fileId);
+      if (!userText) {
+        await enviarTelegram(chatId, '❌ No pude transcribir el audio.');
+        return;
+      }
+      // Eco de la transcripción sin bloquear el arranque de Claude.
+      void enviarTelegram(chatId, `📝 _"${userText}"_`);
+    }
+  } else {
+    return; // fotos, stickers, etc.
+  }
+
+  if (!userText) return;
+  console.log(`💬 Lucas (${fromId}): ${userText}`);
+
+  // "escribiendo…" sin bloquear, y la base P.A.R.A precargada en paralelo con
+  // Claude: cuando una tool necesite resolver un proyecto, ya va a estar en cache.
+  void accionEscribiendo(chatId);
+  void cargarProyectos().catch(() => {});
 
   try {
-    const update = req.body;
-    const message = update.message || update.edited_message;
-    if (!message) return;
+    const respuesta = await procesarConClaude(chatId, userText);
+    const tClaude = Date.now() - t0;
+    await enviarTelegram(chatId, respuesta);
+    console.log(`⏱ mensaje completo: total=${Date.now() - t0} ms (claude+tools=${tClaude} ms, telegram=${Date.now() - t0 - tClaude} ms)`);
+  } catch (e) {
+    console.error('❌ Error procesando:', e.message);
+    await enviarTelegram(chatId, '❌ Se me trabó algo procesando eso. Probá de nuevo en un rato.');
+  }
 
-    const chatId = message.chat.id;
-    let userText = null;
+  // Compactación de memoria DESPUÉS de responder: Lucas no la espera, y al
+  // correr dentro del request todavía tiene CPU asignada.
+  try { await compactarPendiente(chatId); } catch (e) { console.error('⚠️ compactar:', e.message); }
+}
 
-    if (message.text) {
-      userText = message.text.trim();
-    } else if (message.voice || message.audio) {
-      const fileId = message.voice?.file_id || message.audio?.file_id;
-      if (fileId) {
-        await enviarTelegram(chatId, '🎙️ _Transcribiendo..._');
-        userText = await transcribirGroq(fileId);
-        if (!userText) {
-          await enviarTelegram(chatId, '❌ No pude transcribir el audio.');
-          return;
-        }
-        await enviarTelegram(chatId, `📝 _"${userText}"_`);
-      }
-    } else {
-      return;
-    }
+// ─── Webhook Telegram ─────────────────────────────────────────────────────────
+// Se procesa DENTRO del request (200 al final): así el trabajo corre con CPU
+// asignada — Cloud Run estrangula la CPU fuera de los requests, que era la causa
+// principal de la lentitud. Telegram espera ~60 s; nuestro peor caso es ~10 s.
+// El Promise.race de 25 s es un paracaídas: si algo se colgara respondemos 200
+// igual y el dedupe descarta el reintento.
+app.post('/webhook/telegram', async (req, res) => {
+  // Validar secret token: nadie puede inyectar updates falsos aunque tenga la URL.
+  if (WEBHOOK_SECRET && req.get('X-Telegram-Bot-Api-Secret-Token') !== WEBHOOK_SECRET) {
+    console.log('⛔ Webhook con secret token inválido');
+    return res.status(403).send('');
+  }
 
-    if (!userText) return;
-    console.log('💬 Lucas:', userText);
-
-    // procesarConClaude agrega el mensaje del usuario y maneja la memoria.
-    procesarConClaude(chatId, userText)
-      .then(respuesta => {
-        console.log('📤 Respuesta lista');
-        return enviarTelegram(chatId, respuesta);
-      })
-      .catch(async e => {
-        console.error('❌ Error procesando:', e.message);
-        await enviarTelegram(chatId, `❌ Error: ${e.message}`);
-      });
-
+  try {
+    await Promise.race([
+      manejarUpdate(req.body),
+      new Promise(resolve => setTimeout(resolve, 25_000))
+    ]);
   } catch (e) {
     console.error('❌ Webhook error:', e.message);
   }
+  res.status(200).send('');
 });
 
 // ─── Google Chat (mantener por compatibilidad) ────────────────────────────────
@@ -1345,18 +1564,43 @@ app.post('/webhook/google-chat', async (req, res) => {
 });
 
 // ─── Health check ─────────────────────────────────────────────────────────────
+// Reporta el modelo REAL: antes decía sonnet-4-6 mientras el loop usaba Haiku.
+const NOTION_TOKEN_OK = !!process.env.NOTION_TOKEN;
+
 app.get('/health', (req, res) => {
-  res.json({ status: 'running', version: '6.0.0', model: 'claude-sonnet-4-6' });
+  res.json({
+    status: 'running',
+    version: '7.0.0',
+    model: MODEL,
+    effort: EFFORT,
+    notion: NOTION_TOKEN_OK ? '✅' : '❌',
+    calendar: getGoogleAuth() ? '✅' : '❌',
+    whitelist_usuarios: ALLOWED_USER_IDS.length,
+    secret_webhook: WEBHOOK_SECRET ? '✅' : '(sin secret)'
+  });
 });
 
 // ─── Iniciar ──────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Segundo Cerebro Bot v6.0 en puerto ${PORT}`);
-  console.log(`🤖 Modelo: claude-sonnet-4-6`);
-  console.log(`📋 Notion: ${NOTION_DB_ID}`);
-  console.log(`📅 Calendar: ${CALENDAR_ID}`);
-  console.log(`📚 Historial: ${NOTION_HISTORIAL_ID}`);
-  console.log(`📱 Telegram: ${TELEGRAM_TOKEN ? '✅' : '❌'}`);
-  console.log(`🎙️ Groq: ${GROQ_API_KEY ? '✅' : '❌'}`);
-});
+if (require.main === module) {
+  const PORT = process.env.PORT || 8080;
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Segundo Cerebro Bot v7.0 en puerto ${PORT}`);
+    console.log(`🤖 Modelo: ${MODEL} (effort ${EFFORT})`);
+    console.log(`📋 Notion: ${NOTION_DB_ID}`);
+    console.log(`📅 Calendar: ${CALENDAR_ID}`);
+    console.log(`📚 Historial: ${NOTION_HISTORIAL_ID}`);
+    console.log(`📱 Telegram: ${TELEGRAM_TOKEN ? '✅' : '❌'}`);
+    console.log(`🎙️ Groq: ${GROQ_API_KEY ? '✅' : '❌'}`);
+    console.log(`🔐 Secret webhook: ${WEBHOOK_SECRET ? '✅' : '⚠️ sin secret'}`);
+    console.log(`👥 Usuarios autorizados: ${ALLOWED_USER_IDS.length || '⚠️ TODOS (setear TELEGRAM_ALLOWED_USER_IDS)'}`);
+
+    // Warm-up: abrir TLS con Notion y Telegram y precargar la base P.A.R.A,
+    // para que el primer mensaje real no pague los handshakes. Sin bloquear el boot.
+    cargarProyectos()
+      .then(c => console.log(`🔥 Warm-up Notion OK (${c.lista.length} proyectos)`))
+      .catch(e => console.error('⚠️ Warm-up Notion:', e.message));
+    warmupTelegram().then(d => console.log(`🔥 Warm-up Telegram ${d?.ok ? 'OK' : 'falló'}`)).catch(() => {});
+  });
+}
+
+module.exports = { manejarUpdate };
