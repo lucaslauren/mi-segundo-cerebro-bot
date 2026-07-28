@@ -557,7 +557,9 @@ const TOOLS = [
     // cache_control en la ÚLTIMA tool: cachea todo el bloque de tools (se renderiza
     // antes que system y messages). Las lecturas de cache no cuentan para el límite ITPM.
     // Si agregás tools nuevas, mové este cache_control a la nueva última tool.
-    cache_control: { type: 'ephemeral' }
+    // ⚠️ El ttl DEBE coincidir con el del bloque estable del system: la API rechaza
+    // con 400 un bloque ttl='1h' que venga después de uno ttl='5m'.
+    cache_control: { type: 'ephemeral', ttl: '1h' }
   }
 ];
 
@@ -1167,7 +1169,8 @@ async function procesarConClaude(chatId, userText) {
       output_config: { effort: EFFORT },
       // El breakpoint de cache va en el último bloque estable: cachea tools +
       // system de una (el orden de render es tools → system → messages).
-      // ⚠️ Si algún día se cachean las tools, el ttl tiene que coincidir con éste.
+      // ⚠️ El ttl tiene que coincidir con el del cache_control de la última tool
+      // (ver TOOLS): un bloque de 1h después de uno de 5m devuelve 400.
       system: [
         { type: 'text', text: BLOQUE_ESTABLE, cache_control: { type: 'ephemeral', ttl: '1h' } },
         { type: 'text', text: bloqueFecha }
