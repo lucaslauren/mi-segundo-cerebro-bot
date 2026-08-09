@@ -468,6 +468,34 @@ async function esquemaTareas() {
   return esquemaCache;
 }
 
+// Filtro de "cerradas desde tal fecha". Está separado y es puro para poder
+// testear su forma sin pegarle a Notion.
+//
+// ⚠️ EL `or` VA PLANO. Notion acepta como mucho DOS niveles de filtros
+// compuestos: `and` → `or` → propiedad. Un `and` anidado adentro del `or` son
+// tres niveles y la API lo rechaza con un 400 gigante que enumera todos los
+// tipos de filtro que existen — un error que no dice en ningún lado que el
+// problema es la profundidad. Que el `or` plano deje entrar de más (una tarea
+// con Fecha hecho vieja pero editada hace poco) no molesta: se filtra en memoria.
+function filtroVentanaHechas(desde, tieneFechaHecho) {
+  if (!tieneFechaHecho) {
+    // Filtrar por una propiedad que no existe también sería un 400.
+    return { timestamp: 'last_edited_time', last_edited_time: { on_or_after: desde } };
+  }
+  return { or: [
+    { property: 'Fecha hecho', date: { on_or_after: desde } },
+    { timestamp: 'last_edited_time', last_edited_time: { on_or_after: desde } }
+  ]};
+}
+
+// Profundidad de anidamiento de filtros compuestos (and/or). Notion tolera 2.
+function profundidadFiltro(filtro) {
+  if (!filtro || typeof filtro !== 'object') return 0;
+  const hijos = filtro.and || filtro.or;
+  if (!Array.isArray(hijos)) return 0;
+  return 1 + Math.max(0, ...hijos.map(profundidadFiltro));
+}
+
 // Trae las tareas HECHAS de los últimos `dias`, cacheadas por ventana. El cache
 // existe sobre todo por la guardia anti-duplicado, que consulta la ventana corta
 // en cada tarea que se crea.
@@ -480,18 +508,7 @@ async function cargarTareasHechas(dias = 90) {
   const desde = sumarDiasISO(fechaISO(), -dias);
   const [{ porId }, { tieneFechaHecho }] = await Promise.all([cargarProyectos(), esquemaTareas()]);
 
-  // Con la propiedad: filtra por "Fecha hecho", y deja entrar por last_edited_time
-  // a las que se cerraron antes de que existiera. Sin la propiedad: solo por
-  // last_edited_time (filtrar por una propiedad inexistente sería un 400).
-  const ventana = tieneFechaHecho
-    ? { or: [
-        { property: 'Fecha hecho', date: { on_or_after: desde } },
-        { and: [
-          { property: 'Fecha hecho', date: { is_empty: true } },
-          { timestamp: 'last_edited_time', last_edited_time: { on_or_after: desde } }
-        ]}
-      ]}
-    : { timestamp: 'last_edited_time', last_edited_time: { on_or_after: desde } };
+  const ventana = filtroVentanaHechas(desde, tieneFechaHecho);
 
   const paginas = await queryTodas({
     database_id: NOTION_DB_ID,
@@ -846,22 +863,32 @@ async function tool_crear_tarea_notion(input) {
     // Guardia anti-duplicado: si esto ya se hizo hace poco, avisar antes de crear.
     // Pasa seguido con el flujo de voz ("mandale los planos a Julia") cuando la
     // tarea ya se cerró y Lucas no se acuerda.
+    //
+    // ⚠️ FALLA ABIERTA, a propósito. Es un chequeo SECUNDARIO: si la consulta se
+    // rompe, la tarea se crea igual. Ya pasó una vez —un filtro mal armado tiraba
+    // 400 y el bot le decía a Lucas que no podía crear la tarea, cuando el
+    // problema era la verificación y no la creación. Nunca bloquear la operación
+    // principal por un dato secundario.
     if (!input.crear_igual) {
-      const recientes = await cargarTareasHechas(7);
-      const hoy = fechaISO();
-      const yaHecha = recientes
-        .map(t => ({ t, score: puntuarTarea(t, input.titulo, hoy) }))
-        .sort((a, b) => b.score - a.score)[0];
-      if (yaHecha && yaHecha.score >= 10) {
-        return {
-          ok: false, posible_duplicado: true,
-          ya_hecha: {
-            titulo: yaHecha.t.titulo,
-            fecha: yaHecha.t.fecha_hecho || yaHecha.t.fecha_hecho_aprox || null,
-            fecha_aproximada: !yaHecha.t.fecha_hecho || undefined
-          },
-          instruccion: 'Esta tarea parece ser una que Lucas YA cerró hace poco. Decíselo con la fecha (aclarando si es aproximada) y preguntale si igual quiere crearla. Si dice que sí, volvé a llamar crear_tarea_notion con crear_igual: true.'
-        };
+      try {
+        const recientes = await cargarTareasHechas(7);
+        const hoy = fechaISO();
+        const yaHecha = recientes
+          .map(t => ({ t, score: puntuarTarea(t, input.titulo, hoy) }))
+          .sort((a, b) => b.score - a.score)[0];
+        if (yaHecha && yaHecha.score >= 10) {
+          return {
+            ok: false, posible_duplicado: true,
+            ya_hecha: {
+              titulo: yaHecha.t.titulo,
+              fecha: yaHecha.t.fecha_hecho || yaHecha.t.fecha_hecho_aprox || null,
+              fecha_aproximada: !yaHecha.t.fecha_hecho || undefined
+            },
+            instruccion: 'Esta tarea parece ser una que Lucas YA cerró hace poco. Decíselo con la fecha (aclarando si es aproximada) y preguntale si igual quiere crearla. Si dice que sí, volvé a llamar crear_tarea_notion con crear_igual: true.'
+          };
+        }
+      } catch (e) {
+        console.error('⚠️ Guardia anti-duplicado falló, creo la tarea igual:', e.message);
       }
     }
 
@@ -2053,5 +2080,6 @@ module.exports = {
   manejarUpdate,
   normalizar, palabrasSignificativas, distancia, puntuarTarea,
   sumarDiasISO, sumarMinutos, elegirCandidatos,
+  filtroVentanaHechas, profundidadFiltro,
   CHAT_ID_CRON   // exportado solo para que el test verifique que es número
 };

@@ -15,7 +15,8 @@ process.env.TELEGRAM_CHAT_ID ||= '5029988668';
 
 const {
   normalizar, palabrasSignificativas, distancia, puntuarTarea,
-  sumarDiasISO, sumarMinutos, elegirCandidatos, CHAT_ID_CRON
+  sumarDiasISO, sumarMinutos, elegirCandidatos, CHAT_ID_CRON,
+  filtroVentanaHechas, profundidadFiltro
 } = require('../index.js');
 
 let fallos = 0;
@@ -133,6 +134,26 @@ chequear('evento de todo el día = start+1', sumarDiasISO('2026-08-09', 1) !== '
 chequear('sumarMinutos', sumarMinutos('09:30', 45) === '10:15', sumarMinutos('09:30', 45));
 
 // ─────────────────────────────────────────────────────────────────────────────
+console.log('\nFiltros de Notion: nunca más de 2 niveles de and/or');
+// Notion acepta como mucho `and` -> `or` -> propiedad. Un nivel más y responde
+// 400 con una lista enorme de "should be defined" que no menciona en ningún lado
+// que el problema es la profundidad. Este test costó una tarea no creada.
+{
+  chequear('profundidadFiltro cuenta bien un filtro plano',
+    profundidadFiltro({ property: 'Hecho', checkbox: { equals: true } }) === 0);
+  chequear('profundidadFiltro cuenta bien un and simple',
+    profundidadFiltro({ and: [{ property: 'a' }, { property: 'b' }] }) === 1);
+  chequear('profundidadFiltro detecta el anidado de 3 que rompia',
+    profundidadFiltro({ and: [{ property: 'a' }, { or: [{ property: 'b' }, { and: [{ property: 'c' }] }] }] }) === 3);
+
+  // Los filtros reales, envueltos como los manda cargarTareasHechas.
+  for (const tiene of [true, false]) {
+    const completo = { and: [{ property: 'Hecho', checkbox: { equals: true } }, filtroVentanaHechas('2026-08-01', tiene)] };
+    const d = profundidadFiltro(completo);
+    chequear(`filtro de hechas con Fecha hecho=${tiene}: profundidad ${d} <= 2`, d <= 2, `profundidad ${d}`);
+  }
+}
+
 console.log('\nCierre del día: el chat id tiene que ser NÚMERO');
 // La memoria de conversación es un Map indexado por chatId. manejarUpdate usa
 // message.chat.id, que Telegram manda como número. Si el cierre del día usara el
