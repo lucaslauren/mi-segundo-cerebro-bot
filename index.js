@@ -1848,7 +1848,13 @@ async function manejarUpdate(update) {
 // endpoints se protegen con un secret propio, igual que el webhook.
 const CRON_SECRET = process.env.CRON_SECRET || '';
 // En un chat privado de Telegram el chat_id es igual al user_id.
-const CHAT_ID_CRON = process.env.TELEGRAM_CHAT_ID || ALLOWED_USER_IDS[0] || '';
+//
+// ⚠️ VA COMO NÚMERO, no como string. La memoria de conversación es un Map
+// indexado por chatId, y manejarUpdate usa `message.chat.id`, que Telegram manda
+// como número. Con "5029988668" (string) el cierre del día escribiría en un
+// bucket de memoria distinto al del chat real: cuando Lucas contestara "hice la 1
+// y la 3", el modelo no tendría ni idea de qué lista le está hablando.
+const CHAT_ID_CRON = Number(process.env.TELEGRAM_CHAT_ID || ALLOWED_USER_IDS[0]) || null;
 
 // Un reintento de Scheduler no puede mandar el cierre dos veces.
 // ⚠️ Vive en memoria, igual que el dedupe de updates: sirve con UNA instancia.
@@ -1897,9 +1903,13 @@ app.post('/cron/cierre-dia', async (req, res) => {
 
     // Sin pendientes no se manda nada. Un mensaje diario que dice "no tenías nada"
     // entrena a ignorar el mensaje, y entonces tampoco se lee el que sí importa.
+    // ⚠️ Sin pendientes NO se marca el día como enviado. La guardia existe para
+    // que un reintento no duplique un mensaje ya mandado; si no se mandó nada, no
+    // hay nada que proteger. Marcarlo igual hacía que una corrida temprana (una
+    // prueba a mano, por ejemplo) tapara la corrida real de las 21:00 aunque para
+    // entonces Lucas ya hubiera cargado tareas.
     if (!datos.tareas.length) {
       console.log(`🌙 Cierre del día: sin pendientes (cerró ${datos.cerradas_hoy}), no mando nada`);
-      cronEnviado.set('cierre-dia', hoy);
       return;
     }
 
@@ -2042,5 +2052,6 @@ if (require.main === module) {
 module.exports = {
   manejarUpdate,
   normalizar, palabrasSignificativas, distancia, puntuarTarea,
-  sumarDiasISO, sumarMinutos, elegirCandidatos
+  sumarDiasISO, sumarMinutos, elegirCandidatos,
+  CHAT_ID_CRON   // exportado solo para que el test verifique que es número
 };

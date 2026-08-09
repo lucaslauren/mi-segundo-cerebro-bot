@@ -11,10 +11,11 @@
 process.env.CLAUDE_API_KEY ||= 'test';
 process.env.NOTION_TOKEN ||= 'test';
 process.env.NOTION_DATABASE_ID ||= 'test';
+process.env.TELEGRAM_CHAT_ID ||= '5029988668';
 
 const {
   normalizar, palabrasSignificativas, distancia, puntuarTarea,
-  sumarDiasISO, sumarMinutos, elegirCandidatos
+  sumarDiasISO, sumarMinutos, elegirCandidatos, CHAT_ID_CRON
 } = require('../index.js');
 
 let fallos = 0;
@@ -132,5 +133,20 @@ chequear('evento de todo el día = start+1', sumarDiasISO('2026-08-09', 1) !== '
 chequear('sumarMinutos', sumarMinutos('09:30', 45) === '10:15', sumarMinutos('09:30', 45));
 
 // ─────────────────────────────────────────────────────────────────────────────
+console.log('\nCierre del día: el chat id tiene que ser NÚMERO');
+// La memoria de conversación es un Map indexado por chatId. manejarUpdate usa
+// message.chat.id, que Telegram manda como número. Si el cierre del día usara el
+// string de la env var, escribiría en OTRO bucket de memoria: el mensaje con la
+// lista numerada quedaría en un lado y la respuesta de Lucas en otro, y "hice la
+// 1 y la 3" no significaría nada. La Map NO equipara 123 con "123".
+chequear('CHAT_ID_CRON es number', typeof CHAT_ID_CRON === 'number', `es ${typeof CHAT_ID_CRON}`);
+chequear('coincide con un message.chat.id numérico', CHAT_ID_CRON === 5029988668, String(CHAT_ID_CRON));
+{
+  const m = new Map();
+  m.set(5029988668, 'memoria del chat real');
+  chequear('la Map encuentra la memoria con esa clave', m.get(CHAT_ID_CRON) === 'memoria del chat real',
+    'string y number son claves distintas en una Map');
+}
+
 console.log(fallos === 0 ? '\n✅ Todo bien\n' : `\n❌ ${fallos} chequeo(s) fallaron\n`);
 process.exit(fallos === 0 ? 0 : 1);
