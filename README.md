@@ -1,191 +1,151 @@
-# Mi Segundo Cerebro Bot 🧠
+# Segundo Cerebro Bot
 
-Bot inteligente que captura tus tareas por Google Chat, las clasifica con Claude, y las guarda automáticamente en Notion.
+Secretario personal de Lucas por Telegram. Le hablás en texto o en audio y él
+agenda, consulta y cierra tareas en Notion, maneja el Google Calendar y busca en
+Drive. A la noche te escribe él para preguntarte cómo te fue.
 
-## Características
+Corre en Google Cloud Run, en el proyecto `mi-segundo-cerebro-bot` (us-central1).
 
-✅ Recibe mensajes/audios por Google Chat
-✅ Clasifica automáticamente con Claude (Sonnet 4)
-✅ Guarda en Notion (Zona de Acción V4)
-✅ Identifica proyectos (DLP, Tuluka, Smart Dev, etc.)
-✅ Responde confirmando en Google Chat
-✅ Ejecuta en Google Cloud Run (serverless)
+## Cómo funciona
 
-## Requisitos previos
-
-1. **Google Cloud Project** con APIs activadas:
-   - Google Chat API
-   - Google Cloud Speech-to-Text API
-   - Google Drive API
-   - Google Calendar API
-
-2. **Credenciales necesarias:**
-   - Token Notion API
-   - Clave Claude API
-   - Token Google Chat
-   - JSON de credenciales de Google Cloud
-
-3. **Herramientas instaladas:**
-   - Node.js 18+
-   - Google Cloud CLI (`gcloud`)
-   - Git
-
-## Setup local (para testing)
-
-### 1. Clonar y preparar
-
-```bash
-git clone <tu-repo>
-cd mi-segundo-cerebro-bot
-npm install
+```
+Telegram ──webhook──► Cloud Run ──► Claude (tool use) ──► Notion / Calendar / Drive
+Cloud Scheduler ──/cron/*──► ídem (el bot escribe primero)
 ```
 
-### 2. Configurar variables de entorno
+- **Modelo:** `claude-sonnet-5` con thinking adaptive y tool use nativo. No hay
+  intenciones predefinidas: Claude decide qué herramienta usar.
+- **Audios:** se transcriben con Whisper en Groq (`whisper-large-v3-turbo`).
+- **Prompt caching:** el system está partido en un bloque estable (con
+  `cache_control` ttl 1h) y uno volátil con la fecha. El resumen de conversación
+  va como primer mensaje `user`, no en el system, para no invalidar el cache.
+- **Procesamiento dentro del request:** Cloud Run estrangula la CPU fuera de los
+  requests, así que se responde 200 al final, con un `Promise.race` de 25 s de
+  paracaídas.
 
-```bash
-cp .env.example .env
-```
+## Sistema GTD + P.A.R.A
 
-Edita `.env` con tus valores reales:
-- `NOTION_TOKEN`: Token de tu integración Notion
-- `CLAUDE_API_KEY`: Tu clave API de Claude
-- `GOOGLE_CHAT_TOKEN`: Token de Google Chat
-- `GOOGLE_CHAT_SPACE`: ID del espacio de Google Chat
+**Base de tareas** (`NOTION_DATABASE_ID`):
 
-### 3. Correr localmente
+| Propiedad | Tipo | Para qué |
+|---|---|---|
+| `Siguiente acción` | title | La tarea, escrita como acción física (verbo + objeto) |
+| `Contexto` | select | Dónde o con qué se puede hacer. Prefijo `T` = trabajo |
+| `Proyecto` | relation | Al proyecto de la base P.A.R.A |
+| `Dia acción` | date | Cuándo pensás hacerla |
+| `Fecha límite` | date | Cuándo vence de verdad |
+| `En espera` | date | Hasta cuándo está bloqueada esperando a otro |
+| `Me gustaría hoy` | checkbox | Intención del día, aparte de la fecha |
+| `Hecho` | checkbox | Cerrada |
+| `Fecha hecho` | date | **Cuándo** se cerró (ver más abajo) |
 
-```bash
-npm run dev
-```
+**Base P.A.R.A** (proyectos): `Título`, `Categoría P.A.R.A`
+(Proyecto/Area/Recurso/Archivado), `Estado Proyecto` (Activo / En Pausa / Futuro /
+**Completado**).
 
-El servidor corre en `http://localhost:8080`
+## Setup en Notion (a mano, una vez)
 
----
+Tres cosas que el código necesita y no puede crear solo:
 
-## Deploy a Google Cloud Run
+1. **Propiedad `Fecha hecho` (tipo date)** en la base de tareas. Sin ella el bot
+   sigue andando, pero las fechas de cierre salen aproximadas por la última
+   edición de la página y se reportan como tales. El `/health` avisa si falta.
+2. **Valor `Completado`** en el select `Estado Proyecto`.
+3. **Capacidad "Insert comments"** en la integración
+   (notion.so → Connections → la integración → Capabilities). Sin esto
+   `comentar_tarea` muere con `restricted_resource` y no hay informes de tarea.
 
-### 1. Autenticar con Google Cloud
+## Cierre del día
 
-```bash
-gcloud auth login
-gcloud config set project mi-segundo-cerebro-bot
-```
+Todas las noches Cloud Scheduler pega en `POST /cron/cierre-dia` y el bot te
+escribe con las tareas del día que quedaron sin marcar, **numeradas**, más cuántas
+cerraste. Le contestás en lenguaje natural ("hice la 1 y la 3, la 2 pasala a
+mañana, en la 1 anotá que quedamos en revisar el precio") y encadena las
+herramientas solo.
 
-### 2. Crear Secret Manager para credenciales
+El mensaje se compone pasando por Claude, no con una plantilla: además de que
+queda mejor escrito, el intercambio entra en la memoria de conversación por el
+camino normal, que es lo que hace que "la 1 y la 3" signifique algo después.
 
-```bash
-# Guardar el archivo JSON de credenciales
-gcloud secrets create google-credentials --data-file=/ruta/a/tu/credentials.json
-```
+> **Límite conocido:** la memoria de conversación vive en RAM. Si la instancia se
+> recicla entre el mensaje y tu respuesta, el bot pierde la numeración. **No es
+> peligroso**: `buscar_y_marcar_hecha` no marca nada cuando hay ambigüedad, así
+> que en el peor caso te vuelve a preguntar. Persistir la memoria (Firestore) es
+> la mejora pendiente más grande.
 
-### 3. Desplegar a Cloud Run
+Con la misma plomería hay un `POST /cron/plan-dia` opcional para la mañana.
 
-```bash
-gcloud run deploy mi-segundo-cerebro-bot \
-  --source . \
-  --platform managed \
-  --region us-central1 \
-  --allow-unauthenticated \
-  --memory 512Mi \
-  --timeout 60 \
-  --set-env-vars NOTION_TOKEN=tu_token,CLAUDE_API_KEY=tu_clave,GOOGLE_CHAT_TOKEN=tu_token
-```
+## Endpoints
 
-Google Cloud Run te dará una URL como:
-```
-https://mi-segundo-cerebro-bot-xxxxx-uc.a.run.app
-```
-
-### 4. Configurar webhook en Google Chat
-
-En Google Chat, configura el webhook para apunte a:
-```
-https://tu-url-cloud-run/webhook/google-chat
-```
-
----
-
-## Flujo de uso
-
-1. **Mandas un mensaje a Google Chat:**
-   ```
-   "Llamar a Franco sobre UF11A"
-   ```
-
-2. **El bot:**
-   - Recibe el mensaje
-   - Clasifica con Claude
-   - Identifica proyecto (DLP, Tuluka, etc.)
-   - Guarda en Notion (Zona de Acción)
-   - Te contesta confirmando
-
-3. **En Notion aparece:**
-   - Título: "Llamar a Franco sobre UF11A"
-   - Proyecto: "DLP"
-   - Contexto: "Acciones siguientes"
-   - Prioridad: "Normal"
-   - Fecha límite: si aplica
-
----
+| Ruta | Qué hace | Auth |
+|---|---|---|
+| `POST /webhook/telegram` | Mensajes de Telegram | header `X-Telegram-Bot-Api-Secret-Token` |
+| `POST /cron/cierre-dia` | Cierre de la noche | header `X-Cron-Secret` |
+| `POST /cron/plan-dia` | Plan de la mañana | header `X-Cron-Secret` |
+| `GET /health` | Estado real (prueba Notion y Calendar de verdad) | — |
 
 ## Variables de entorno
 
-| Variable | Descripción | Ejemplo |
-|----------|-------------|---------|
-| `NOTION_TOKEN` | Token API de Notion | `ntn_xxx...` |
-| `NOTION_DATABASE_ID` | ID de Zona de Acción V4 | `2fe6046f...` |
-| `CLAUDE_API_KEY` | Clave API de Claude | `sk-ant-xxx...` |
-| `GOOGLE_CHAT_TOKEN` | Token de Google Chat | `xxxxx` |
-| `GOOGLE_CHAT_SPACE` | ID del espacio | `spaces/XXXXXX` |
-| `PORT` | Puerto (default 8080) | `8080` |
-| `NODE_ENV` | Entorno | `production` |
+Ver [.env.example](.env.example). Las que no son obvias:
 
----
+- **`TELEGRAM_ALLOWED_USER_IDS`** — obligatoria. El bot **falla cerrado**: vacía,
+  no le contesta a nadie. Tiene escritura sobre Notion y Calendar.
+- **`CRON_SECRET`** — sin esto los endpoints de cron quedan cerrados. Es un secret
+  propio, distinto al del webhook: son dos superficies y se rotan por separado.
+- **`TELEGRAM_CHAT_ID`** — a quién le escribe cuando arranca él. En chat privado
+  es igual al user id. Si se omite, usa el primero de la whitelist.
+- `CLAUDE_MODEL` / `CLAUDE_EFFORT` — defaults `claude-sonnet-5` y `medium`.
 
-## Troubleshooting
+## Desarrollo
 
-### "Error: No text found in message"
-- Verifica que el mensaje tenga contenido
-- Google Chat debe enviar `message.text`
-
-### "Error saving to Notion"
-- Verifica que el token Notion sea válido
-- Confirma que `NOTION_DATABASE_ID` es correcto
-- Asegúrate que la integración tiene acceso a esa database
-
-### "Error with Claude classification"
-- Verifica que `CLAUDE_API_KEY` sea válido
-- Comprueba que tienes saldo en la cuenta Claude
-
-### "Error sending Google Chat message"
-- Verifica `GOOGLE_CHAT_TOKEN` y `GOOGLE_CHAT_SPACE`
-- Asegúrate que el bot tiene permisos en el espacio
-
----
-
-## Monitoreo
-
-Ver logs en Cloud Run:
 ```bash
-gcloud run logs read mi-segundo-cerebro-bot --limit 50
+npm install
+npm test     # sintaxis + lógica de matching + smoke test de arranque
+npm run dev  # polling local, sin webhook
 ```
 
-Health check:
+> ⚠️ `npm run dev` **borra el webhook de producción**. Al terminar hay que volver
+> a registrarlo o el bot en la nube queda mudo.
+
+Los tests no necesitan credenciales: cubren la lógica pura (matching de tareas,
+aritmética de fechas) y un arranque real del server contra `/health` y los
+endpoints de cron. `node --check` solo, no alcanza — no detecta referencias rotas.
+
+## Deploy
+
+Los secretos van por **Secret Manager**, no por `--set-env-vars`.
+
 ```bash
-curl https://tu-url-cloud-run/health
+gcloud run deploy mi-segundo-cerebro-bot \
+  --source . --region us-central1 --platform managed \
+  --allow-unauthenticated --min-instances 1 --max-instances 1 \
+  --set-secrets="CLAUDE_API_KEY=claude-api-key:latest,NOTION_TOKEN=notion-token:latest,TELEGRAM_BOT_TOKEN=telegram-bot-token:latest,GROQ_API_KEY=groq-api-key:latest,GOOGLE_OAUTH_REFRESH_TOKEN=google-oauth-refresh-token:latest,TELEGRAM_WEBHOOK_SECRET=telegram-webhook-secret:latest,CRON_SECRET=cron-secret:latest" \
+  --set-env-vars="NOTION_DATABASE_ID=...,GOOGLE_CALENDAR_ID=lucas@dlaurenzano.com,TELEGRAM_ALLOWED_USER_IDS=...,TELEGRAM_CHAT_ID=..."
 ```
 
----
+- **`--max-instances 1`** no es opcional: el dedupe de updates y la guardia
+  anti-doble-envío del cierre viven en memoria.
+- **`--min-instances 1`** tampoco, desde que hay cron: con 0, el disparo de las
+  21:00 pega contra un contenedor frío y paga 2–4 s antes de empezar.
 
-## Próximas fases
+Registrar el webhook:
 
-**Fase 2:** Análisis semanal y sugerencias
-**Fase 3:** Integración Google Calendar
-**Fase 4:** Extracción de datos → Sheets automáticos
-**Fase 5:** Dashboard de métricas
+```bash
+curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
+  -d "url=https://<url-del-servicio>/webhook/telegram" \
+  -d "secret_token=$TELEGRAM_WEBHOOK_SECRET"
+```
 
----
+Programar el cierre del día (Buenos Aires es siempre UTC-3, sin horario de verano):
 
-## Soporte
+```bash
+gcloud scheduler jobs create http cierre-dia \
+  --location us-central1 --schedule "0 21 * * *" \
+  --time-zone "America/Argentina/Buenos_Aires" \
+  --uri "https://<url-del-servicio>/cron/cierre-dia" --http-method POST \
+  --headers "X-Cron-Secret=<el-mismo-CRON_SECRET>" \
+  --max-retry-attempts 1
+```
 
-Para problemas o mejoras, abre un issue o contacta a Lucas.
+`--max-retry-attempts 1` para que un reintento no dispare dos cierres. El bot
+igual descarta el segundo del mismo día, pero mejor no depender solo de eso.

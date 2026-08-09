@@ -1,11 +1,12 @@
 {
   "name": "mi-segundo-cerebro-bot",
-  "version": "7.0.0",
+  "version": "7.1.0",
   "description": "Secretario personal IA — Telegram + Claude + Notion + Calendar + Drive",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node dev-polling.js"
+    "dev": "node dev-polling.js",
+    "test": "node --check index.js && node scripts/verificar-matching.js && node scripts/verificar-arranque.js"
   },
   "dependencies": {
     "express": "^4.18.2",
